@@ -5,8 +5,8 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-# Cryptography 라이브러리 임포트
-from cryptography.fernet import Fernet
+# Cryptography 라이브러리 임포트 및 수정 (InvalidToken 추가)
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives import hashes
@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ==============================================================================
 
 # --- 키 파일 저장 경로를 사용자가 지정한 폴더로 고정 ---
-FIXED_KEY_DIR = r""
+FIXED_KEY_DIR = ""
 # 키 파일의 전체 절대 경로 설정
 FERNET_KEY_PATH = os.path.join(FIXED_KEY_DIR, "fernet.key")
 PRIVATE_KEY_PATH = os.path.join(FIXED_KEY_DIR, "private.pem")
@@ -57,24 +57,28 @@ def run_port_scanner(target_ip, start_port, end_port, callback):
         callback(f"❌ 스캔 오류 발생: {e}\n")
 
 
-# --- B. Fernet (대칭키) 함수 (생략) ---
+# --- B. Fernet (대칭키) 함수 ---
 def load_fernet_key(): 
     try: return open(FERNET_KEY_PATH, "rb").read()
     except FileNotFoundError: return None
 
+# Fernet 암호화 함수 수정: 원본 확장자 보존
 def encrypt_file_auto_delete(filename, key): 
-    base, ext = os.path.splitext(filename) 
+    # base, ext = os.path.splitext(filename) # 원본에서 사용하지 않음
     f = Fernet(key)
     with open(filename, "rb") as file: encrypted_data = f.encrypt(file.read())
     
-    encrypted_filename = base + ".fnet" 
+    # 원본 파일 이름 전체에 ".fnet"을 붙임 (예: doc.txt -> doc.txt.fnet)
+    encrypted_filename = filename + ".fnet" 
     
     with open(encrypted_filename, "wb") as file: file.write(encrypted_data)
         
     os.remove(filename) 
     return encrypted_filename 
 
+# Fernet 복호화 함수: 원본 파일 이름 (확장자 포함) 복원
 def decrypt_file_auto_delete(encrypted_filename, key): 
+    # ".fnet"만 제거하여 원본 파일 이름 복원 (예: doc.txt.fnet -> doc.txt)
     if encrypted_filename.lower().endswith(".fnet"):
         original_filename = encrypted_filename[:-5] 
     else:
@@ -88,7 +92,7 @@ def decrypt_file_auto_delete(encrypted_filename, key):
     os.remove(encrypted_filename) 
     return original_filename
 
-# --- C. RSA (비대칭키) 함수  ---
+# --- C. RSA (비대칭키) 함수 ---
 def generate_rsa_key_pair(): 
     os.makedirs(FIXED_KEY_DIR, exist_ok=True) 
     
@@ -114,7 +118,7 @@ def load_private_key():
         return serialization.load_pem_private_key(key_file.read(), password=None)
 
 def hybrid_encrypt_file_auto_delete(filename, public_key): 
-    base, ext = os.path.splitext(filename) 
+    # base, ext = os.path.splitext(filename) # 원본에서 사용하지 않음
     
     fernet_key = Fernet.generate_key()
     f = Fernet(fernet_key)
@@ -123,7 +127,7 @@ def hybrid_encrypt_file_auto_delete(filename, public_key):
     
     with open(filename, "rb") as file: encrypted_file_data = f.encrypt(file.read())
     
-    output_filename = base + ".rsa_enc"
+    output_filename = filename + ".rsa_enc"
     
     with open(output_filename, "wb") as file:
         file.write(len(encrypted_fernet_key).to_bytes(4, byteorder='big')) 
@@ -163,7 +167,7 @@ def hybrid_decrypt_file_auto_delete(encrypted_filename, private_key):
 class SecurityToolGUI:
     def __init__(self, master):
         self.master = master
-        master.title("🛡️ 교륙용 파이썬 통합 보안 도구 ")
+        master.title("🛡️ 교육용 파이썬 통합 보안 도구 ")
         
         self.notebook = ttk.Notebook(master)
         
@@ -174,7 +178,7 @@ class SecurityToolGUI:
         
         self.notebook.pack(expand=1, fill="both", padx=10, pady=10)
 
-    # --- 1. 포트 스캐너 탭 (생략) ---
+    # --- 1. 포트 스캐너 탭 ---
     def create_port_scanner_tab(self):
         port_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(port_frame, text="🌐 포트 스캐너")
@@ -206,7 +210,7 @@ class SecurityToolGUI:
         except Exception as e:
             messagebox.showerror("오류 발생", f"스캔 초기화 오류: {e}")
             
-    # --- 2. Fernet (대칭키) 탭 (생략) ---
+    # --- 2. Fernet (대칭키) 탭 ---
     def create_fernet_tab(self):
         fernet_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(fernet_frame, text="🔒 Fernet 암호화")
@@ -234,11 +238,17 @@ class SecurityToolGUI:
         except Exception as e: messagebox.showerror("오류", f"키 생성 실패: {e}")
 
     def execute_fernet_encrypt(self):
-        filename = self.fernet_file_path.get(); key = load_fernet_key()
+        filename = self.fernet_file_path.get()
+        key = load_fernet_key()
         if not key: messagebox.showerror("오류", f"키 파일('{FERNET_KEY_FILE}')을 찾을 수 없습니다. 키를 먼저 생성하세요."); return
         try:
             output_file = encrypt_file_auto_delete(filename, key)
+            
+            # 암호화 성공 후 입력 필드를 비움
+            self.fernet_file_path.delete(0, tk.END)
+            
             messagebox.showinfo("성공", f"🔒 파일이 성공적으로 암호화되었으며, 원본 파일이 삭제되었습니다.\n출력: {output_file}")
+            
         except FileNotFoundError: messagebox.showerror("오류", "대상 파일을 찾을 수 없습니다.")
         except Exception as e: messagebox.showerror("암호화 실패", f"오류: {e}")
 
@@ -251,11 +261,19 @@ class SecurityToolGUI:
             
         try:
             output_file = decrypt_file_auto_delete(filename, key)
+            
+            # 복호화 성공 후 입력 필드를 비움
+            self.fernet_file_path.delete(0, tk.END)
+            
             messagebox.showinfo("성공", f"🔓 파일이 성공적으로 복호화되었으며, 암호화 파일이 삭제되었습니다.\n출력: {output_file}")
-        except Exception:
-            messagebox.showerror("복호화 실패", "키가 올바르지 않거나 파일이 손상되었습니다.")
+        
+        except InvalidToken:
+            messagebox.showerror("복호화 실패", "키가 올바르지 않거나 파일이 손상되었습니다. (Fernet 키 확인 필요)")
+        except Exception as e:
+            messagebox.showerror("복호화 실패", f"예기치 않은 오류 발생: {e}")
 
-    # --- 3. RSA (비대칭키) 탭 (생략) ---
+
+    # --- 3. RSA (비대칭키) 탭 ---
     def create_rsa_tab(self):
         rsa_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(rsa_frame, text="🔑 RSA 하이브리드")
@@ -283,7 +301,12 @@ class SecurityToolGUI:
         try:
             pub_key = load_public_key()
             output_file = hybrid_encrypt_file_auto_delete(filename, pub_key)
+            
+            #암호화 성공 후 입력 필드를 비움
+            self.rsa_file_path.delete(0, tk.END)
+            
             messagebox.showinfo("성공", f"🔒 파일이 성공적으로 RSA 암호화되었으며, 원본 파일이 삭제되었습니다.\n출력: {output_file}")
+            
         except FileNotFoundError: messagebox.showerror("오류", "대상 파일 또는 공개키(public.pem)를 찾을 수 없습니다. 키 쌍을 먼저 생성하세요.")
         except Exception as e: messagebox.showerror("암호화 실패", f"오류: {e}")
 
@@ -294,19 +317,26 @@ class SecurityToolGUI:
         try:
             priv_key = load_private_key()
             output_file = hybrid_decrypt_file_auto_delete(filename, priv_key)
+            
+            # 복호화 성공 후 입력 필드를 비움
+            self.rsa_file_path.delete(0, tk.END)
+            
             messagebox.showinfo("성공", f"🔓 파일이 성공적으로 복호화되었으며, 암호화 파일이 삭제되었습니다.\n출력: {output_file}")
+        
         except FileNotFoundError: 
             messagebox.showerror("오류", "대상 파일 또는 개인키(private.pem)를 찾을 수 없습니다. 키 쌍을 먼저 생성하세요.")
-        except Exception: 
-            messagebox.showerror("복호화 실패", "개인키가 올바르지 않거나 파일이 손상되었습니다.")
+        except (InvalidToken, ValueError, TypeError) as e: 
+             messagebox.showerror("복호화 실패", f"개인키가 올바르지 않거나 암호화 파일이 손상되었습니다.\n상세: {type(e).__name__}")
+        except Exception as e: 
+            messagebox.showerror("복호화 실패", f"예기치 않은 오류 발생: {e}")
 
-    # --- 4. 제작자 정보 탭 (새로 추가됨) ---
+# --- 4. 제작자 정보 탭 ---
     def create_developer_tab(self):
         dev_frame = ttk.Frame(self.notebook, padding="15")
         self.notebook.add(dev_frame, text="💡 제작자 정보")
         
+        # 1. 상단 정보 Label 배치
         ttk.Label(dev_frame, text="--- 🛡️ 교육용 파이썬 보안 도구 ---", font=('Helvetica', 14, 'bold')).pack(pady=(10, 5))
-        
         ttk.Label(dev_frame, text="프로젝트: 통합 파일 암호화 및 네트워크 보안 학습용 도구", font=('Helvetica', 10)).pack(pady=2, anchor='w')
         ttk.Label(dev_frame, text="제작자:Dangel", font=('Helvetica', 10, 'bold')).pack(pady=5, anchor='w')
         
@@ -314,17 +344,30 @@ class SecurityToolGUI:
 
         ttk.Label(dev_frame, text="📚 개발 배경 및 학습 과정", font=('Helvetica', 12, 'bold')).pack(pady=5, anchor='w')
         
-        info_text = tk.Text(dev_frame, height=8, width=50, wrap='word', bd=1, relief='sunken', font=('Helvetica', 10))
-        info_text.insert(tk.END, "이 도구는 제가 보안도구 공부를 하기위해 만든것입니다 근데 나머지 기능은 잘되나 복호화가 안돼는 문제가 있어 암호화기능은 안쓰시는걸 권장합니다\n\n")
+        # 2. Text 위젯을 담을 컨테이너 생성 및 배치
+        text_container = ttk.Frame(dev_frame)
+        text_container.pack(fill='both', expand=True, pady=5) 
+        info_text = tk.Text(text_container, height=10, width=50, wrap='word', bd=1, relief='sunken', font=('Helvetica', 10))
+        scroll = ttk.Scrollbar(text_container, command=info_text.yview)
+        info_text.config(yscrollcommand=scroll.set)
+        
+        # 5. Text와 Scrollbar 배치
+        scroll.pack(side='right', fill='y')
+        info_text.pack(side='left', fill='both', expand=True) 
+
+        # 6. 내용 삽입
+        info_text.insert(tk.END, "이 도구는 제가 보안도구 공부를 하기위해 만든것입니다. 이제 RSA와 Fernet의 파일 이름 처리 로직 오류가 수정되었습니다. 학습에 도움이 되기를 바랍니다.\n\n")
+        info_text.insert(tk.END, "⚠️이걸로 남의 컴의 악용해 그 사람이 피해를 입을경우 저의 책임이 아닌 여러분의 책임입니다\n\n")
         info_text.insert(tk.END, "주요 학습 내용:\n")
         info_text.insert(tk.END, "- 비동기 멀티스레딩을 활용한 포트 스캐너 구현\n")
         info_text.insert(tk.END, "- Fernet(대칭키) 암호화 및 안전한 파일 입출력\n")
         info_text.insert(tk.END, "- RSA(비대칭키) 하이브리드 암호화 로직 및 키 관리\n")
-        info_text.config(state='disabled') # 읽기 전용으로 설정
-        info_text.pack(pady=5)
         
+        # 7. 읽기 전용으로 설정
+        info_text.config(state='disabled') 
+        
+        # 8. 하단 Label 배치
         ttk.Label(dev_frame, text="📢 제작자도 현재 배우는 중입니다. 오류 보고 및 피드백은 언제나 환영합니다.", foreground='blue').pack(pady=10)
-
 
     # --- 공통 유틸리티 ---
     def browse_file(self, entry_widget):
@@ -339,6 +382,12 @@ class SecurityToolGUI:
 # ==============================================================================
 
 if __name__ == '__main__':
+    try:
+        if not os.path.exists(FIXED_KEY_DIR):
+            os.makedirs(FIXED_KEY_DIR, exist_ok=True)
+    except Exception as e:
+        messagebox.showwarning("경로 오류", f"키 저장 경로 '{FIXED_KEY_DIR}' 생성에 실패했습니다. 권한을 확인하세요. : {e}")
+        
     root = tk.Tk()
     app = SecurityToolGUI(root)
     root.mainloop()
