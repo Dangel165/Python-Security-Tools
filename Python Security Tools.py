@@ -356,7 +356,8 @@ class SecurityToolGUI:
         info_text.pack(side='left', fill='both', expand=True) 
 
         # 6. 내용 삽입
-        info_text.insert(tk.END, "이 도구는 제가 보안도구 공부를 하기위해 만든것입니다. 이제 RSA와 Fernet의 파일 이름 처리 로직 오류가 수정되었습니다. 학습에 도움이 되기를 바랍니다.\n\n")
+        info_text.insert(tk.END, "이 도구는 보안도구 공부를 하기위해 만든것입니다. 학습에 도움이 되기를 바랍니다.\n\n")
+        info_text.insert(tk.END, "2025_11_25 버그 수정:RSA,AES 파일 복호화할떄 파일 확장자가 없어지거나 내용이 없어지는 버그를 수정했습니다\n\n")
         info_text.insert(tk.END, "⚠️이걸로 남의 컴의 악용해 그 사람이 피해를 입을경우 저의 책임이 아닌 여러분의 책임입니다\n\n")
         info_text.insert(tk.END, "주요 학습 내용:\n")
         info_text.insert(tk.END, "- 비동기 멀티스레딩을 활용한 포트 스캐너 구현\n")
